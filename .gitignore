@@ -16,3 +16,4 @@ predict_api_caller.txt
 airflow_password_caller.txt
 pipeline/migrate_dataset_to_postgres.py
 pipeline/migrate_thumbnails_to_minio.py
+ARM_activation.md
