@@ -166,6 +166,11 @@ docker compose logs airflow-api-server | grep password
 # (PowerShell: docker compose logs airflow-api-server | Select-String -Pattern "password")
 # UI: http://localhost:8080, username "admin", password from that line
 
+# --- Using Airflow UI ---
+# 6. Log in with username "admin" and password based on the previous output
+# 7. Execute 'run_ingestion' on 'DAG' section.
+
+# --- Using CLI (bash/powershell) ---
 # 6. Confirm both DAGs parsed with no import errors
 docker compose exec airflow-scheduler airflow dags list
 docker compose exec airflow-scheduler airflow dags list-import-errors

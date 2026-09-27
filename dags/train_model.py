@@ -2,6 +2,11 @@
 
 Runs models/train.py inside a ytpp-worker container.
 
+schedule=None: not on its own clock. Triggered automatically by embed_new's
+trigger_train_model task (with trigger_rule="all_done", so it fires whether
+embedding succeeded or failed -- see embed_new.py's docstring for why that's
+safe). Still runnable by hand (`airflow dags trigger train_model`) any time.
+
 Unlike ingest_new/embed_new, this task's outputs must survive the container's
 removal: auto_remove="success" wipes anything written only inside the
 container's own filesystem, and train.py writes its checkpoint, model bundle,
