@@ -1,4 +1,4 @@
-"""ingest_new -- daily incremental ingestion.
+"""ingest_new -- monthly incremental ingestion.
 
 Runs pipeline/run_ingestion.py (already idempotent/upsert-safe -- see its
 docstring) inside a ytpp-worker container on the same Docker network as
@@ -38,7 +38,7 @@ WORKER_ENV = {
 with DAG(
     dag_id="ingest_new",
     description="Incremental YouTube ingestion -> Postgres + MinIO",
-    schedule="@daily",
+    schedule="@monthly",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,

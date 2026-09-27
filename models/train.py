@@ -267,18 +267,234 @@ def export_bundle(*, checkpoint, df, train_idx, test_metrics):
     versioned_path = os.path.join(BUNDLE_DIR, f"{IMAGE_ENCODER}{_suffix}_{version}.pt")
     torch.save(bundle, versioned_path)
 
+    # NOTE: no longer unconditionally overwrites latest_<name>.pt here --
+    # that's now a promotion decision (see promote_if_better()), not an
+    # automatic side effect of exporting. Every training run produces a
+    # versioned bundle regardless; only a promoted one becomes "latest".
     latest_path = os.path.join(BUNDLE_DIR, f"latest_{IMAGE_ENCODER}{_suffix}.pt")
-    torch.save(bundle, latest_path)
 
-    # sha256 of the versioned file, so a deploy can confirm it copied the
-    # bundle it thinks it copied
+    # sha256 of the versioned file, so a deploy (or the promotion log) can
+    # confirm it copied the bundle it thinks it copied
     with open(versioned_path, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
 
     print(f"\nSaved model bundle: {versioned_path}")
-    print(f"Also updated:       {latest_path}")
     print(f"sha256: {digest}")
-    return versioned_path
+    return versioned_path, latest_path, bundle
+
+
+# --- Promotion gate -----------------------------------------------------
+#
+# export_bundle() always writes a versioned bundle; whether it also becomes
+# the one serving/bundle.py actually loads (latest_<name>.pt) is decided
+# here, after training, using two gates on this run's own time-based test
+# split:
+#
+#   1. Hard gate -- the new model must beat a trivial linear-on-
+#      trailing_avg_views baseline (same idea as models/baseline.py).
+#      Catches a training run that's broken outright (bad data, a code
+#      regression, a bad batch of embeddings), independent of how it
+#      compares to whatever's currently live.
+#   2. Soft gate -- a paired bootstrap CI on (new Spearman - old Spearman),
+#      both measured on this run's test rows. We only REJECT if the CI's
+#      upper bound falls below CI_REJECT_MARGIN, i.e. we're confident the
+#      new model is worse by more than that margin. A tie (CI overlapping
+#      0, or the small negative band up to the margin) still promotes --
+#      trends drift here (audience behavior, channel content, platform
+#      dynamics), so a model trained on more recent data is preferred
+#      whenever the data can't clearly tell the two apart.
+#
+# CI_REJECT_MARGIN is the one knob this exposes for now -- adjust directly
+# (or via the env var) as you get a feel for how noisy the CI is in
+# practice; nothing else here depends on its exact value.
+CI_REJECT_MARGIN = float(os.environ.get("PROMOTION_CI_REJECT_MARGIN", "-0.01"))
+N_BOOTSTRAP = int(os.environ.get("PROMOTION_N_BOOTSTRAP", "2000"))
+PROMOTION_LOG_PATH = "experiments/promotions.jsonl"
+
+
+def _linear_baseline_spearman(train_df, test_df):
+    """Same trivial baseline as models/baseline.py's run_linear (target ~
+    log1p(trailing_avg_views)), inlined here rather than imported to avoid
+    a circular import (baseline.py imports from this module). Kept as the
+    hard-gate floor: if the fusion model can't beat this, something's
+    broken, regardless of the promotion comparison against the live model.
+    """
+    from sklearn.linear_model import LinearRegression
+
+    X_train = np.log1p(train_df["trailing_avg_views"].values).reshape(-1, 1)
+    X_test = np.log1p(test_df["trailing_avg_views"].values).reshape(-1, 1)
+    y_train = train_df["target"].values
+    y_test = test_df["target"].values
+
+    model = LinearRegression().fit(X_train, y_train)
+    preds = model.predict(X_test)
+    corr, _ = spearmanr(preds, y_test)
+    return corr
+
+
+def _predict_with_bundle(bundle, df, test_idx, image_embeddings, text_embeddings, device):
+    """Run a previously-exported bundle's model on this run's test rows,
+    reproducing THAT bundle's own scaler / genre_categories / feature-column
+    snapshot -- not this run's module-level TABULAR_*_COLS or USE_SIM --
+    so the comparison is a faithful like-for-like against what's actually
+    deployed, even if features or USE_SIM have changed since it was trained.
+
+    Mirrors build_tabular_matrix() in models/dataset.py, but that function
+    reads columns off module globals rather than taking them as an argument,
+    so it can't be reused directly for an older bundle's column set.
+    """
+    test_df = df.iloc[test_idx].copy()
+    fc = bundle["feature_columns"]
+
+    if bundle["use_sim"] and "clip_sim" not in test_df.columns:
+        test_df["clip_sim"] = cosine_rows(image_embeddings[test_idx], text_embeddings[test_idx])
+
+    log_scaler, numeric_scaler = bundle["scaler"]
+    log_cols = test_df[fc["log_cols"]].astype(float).apply(np.log1p).values
+    numeric_cols = test_df[fc["numeric_cols"]].astype(float).values
+    log_scaled = log_scaler.transform(log_cols)
+    numeric_scaled = numeric_scaler.transform(numeric_cols)
+    numeric_all_scaled = np.concatenate([log_scaled, numeric_scaled], axis=1)
+
+    bool_cols = test_df[fc["bool_cols"]].astype(float).values
+
+    genre_categories = bundle["genre_categories"]
+    genre_onehot = np.zeros((len(test_df), len(genre_categories)), dtype=np.float32)
+    for i, genre in enumerate(test_df["genre"].values):
+        if genre in genre_categories:
+            genre_onehot[i, genre_categories.index(genre)] = 1.0
+
+    tabular = np.concatenate(
+        [numeric_all_scaled, bool_cols, genre_onehot], axis=1
+    ).astype(np.float32)
+
+    model = LateFusionModel(
+        image_dim=bundle["image_dim"], text_dim=bundle["text_dim"], tabular_dim=bundle["tabular_dim"],
+    ).to(device)
+    model.load_state_dict(bundle["model_state_dict"])
+    model.eval()
+
+    with torch.no_grad():
+        preds = model(
+            torch.tensor(image_embeddings[test_idx], dtype=torch.float32, device=device),
+            torch.tensor(text_embeddings[test_idx], dtype=torch.float32, device=device),
+            torch.tensor(tabular, dtype=torch.float32, device=device),
+        ).cpu().numpy()
+    return preds
+
+
+def paired_bootstrap_ci(new_preds, old_preds, targets, n_bootstrap, seed, ci=0.95):
+    """CI for (new Spearman - old Spearman) on the shared test set. Each
+    resample draws test ROWS (with replacement), not predictions
+    independently, so the pairing between the two models is preserved --
+    every resample compares both models on the exact same (resampled) rows.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(targets)
+    diffs = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        new_corr, _ = spearmanr(new_preds[idx], targets[idx])
+        old_corr, _ = spearmanr(old_preds[idx], targets[idx])
+        diffs[i] = new_corr - old_corr
+    alpha = (1 - ci) / 2
+    lower, upper = np.quantile(diffs, [alpha, 1 - alpha])
+    return float(lower), float(upper)
+
+
+def _log_promotion(decision):
+    os.makedirs(os.path.dirname(PROMOTION_LOG_PATH), exist_ok=True)
+    with open(PROMOTION_LOG_PATH, "a") as f:
+        f.write(json.dumps(decision) + "\n")
+
+
+def _write_airflow_xcom(payload):
+    """Hand the promotion decision back to Airflow as this task's XCom.
+
+    Second correction on this function, for the record: retrieve_output=True
+    + retrieve_output_path (Docker's get_archive + unpickle) looked like the
+    "proper" structured-XCom mechanism, but DockerOperator's
+    _attempt_to_retrieve_result() wraps that call in a bare
+    `except APIError: return None` with no logging at all -- so when it
+    failed (observed: run_training produced no XCom whatsoever, not even
+    None), there was no way to see why.
+
+    Falling back to the simpler, already-proven path instead: do_xcom_push
+    (xcom_all=False, the default) just returns the last non-empty line of
+    container stdout as the XCom value -- exactly what worked in the first
+    two real runs, where our human-readable promotion print was correctly
+    captured. So: print the decision as one JSON line, and this MUST be the
+    absolute last thing main() prints -- nothing may print after this call
+    returns, or that later line becomes the XCom instead.
+    """
+    print(json.dumps(payload))
+
+
+def promote_if_better(*, versioned_path, latest_path, new_preds, targets,
+                       linear_baseline_spearman, df, test_idx,
+                       image_embeddings, text_embeddings, device):
+    """Decide whether versioned_path should become latest_path (the bundle
+    serving/bundle.py actually loads). See the module comment above for the
+    two-gate design. Always logs the decision to PROMOTION_LOG_PATH, whether
+    promoted or not, for later review.
+
+    Returns the full decision dict (not just a bool) -- the train_model DAG
+    hands this whole thing to Airflow as an XCom (see _write_airflow_xcom
+    below and dags/train_model.py's check_promotion task), and any future
+    logging/alerting module will want the reason/metrics, not just yes-or-no.
+    """
+    new_spearman, _ = spearmanr(new_preds, targets)
+    decision = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "versioned_path": versioned_path,
+        "new_spearman": float(new_spearman),
+        "linear_baseline_spearman": float(linear_baseline_spearman),
+    }
+
+    if not np.isfinite(new_spearman) or new_spearman <= linear_baseline_spearman:
+        decision["promoted"] = False
+        decision["reason"] = "failed hard gate: did not beat linear (trailing_avg_views) baseline"
+        _log_promotion(decision)
+        print(f"\n[promotion] REJECTED -- {decision['reason']} "
+              f"(new={new_spearman:.4f}, baseline={linear_baseline_spearman:.4f})")
+        return decision
+
+    if not os.path.exists(latest_path):
+        decision["promoted"] = True
+        decision["reason"] = "no currently-served bundle to compare against (first promotion)"
+        _log_promotion(decision)
+        import shutil
+        shutil.copyfile(versioned_path, latest_path)
+        print(f"\n[promotion] PROMOTED -- {decision['reason']}")
+        return decision
+
+    live_bundle = torch.load(latest_path, map_location=device, weights_only=False)
+    old_preds = _predict_with_bundle(live_bundle, df, test_idx, image_embeddings, text_embeddings, device)
+    old_spearman, _ = spearmanr(old_preds, targets)
+
+    lower, upper = paired_bootstrap_ci(new_preds, old_preds, targets, N_BOOTSTRAP, seed=SEED)
+    decision.update(
+        old_spearman=float(old_spearman), ci_lower=lower, ci_upper=upper,
+        ci_reject_margin=CI_REJECT_MARGIN, n_bootstrap=N_BOOTSTRAP,
+    )
+
+    if upper < CI_REJECT_MARGIN:
+        decision["promoted"] = False
+        decision["reason"] = "CI confidently below reject margin -- new model is worse than live model"
+        _log_promotion(decision)
+        print(f"\n[promotion] REJECTED -- {decision['reason']} "
+              f"(new={new_spearman:.4f}, old={old_spearman:.4f}, "
+              f"CI=[{lower:.4f}, {upper:.4f}], margin={CI_REJECT_MARGIN})")
+        return decision
+
+    decision["promoted"] = True
+    decision["reason"] = "beat hard gate; not confidently worse than live model (ties go to newer)"
+    _log_promotion(decision)
+    import shutil
+    shutil.copyfile(versioned_path, latest_path)
+    print(f"\n[promotion] PROMOTED -- {decision['reason']} "
+          f"(new={new_spearman:.4f}, old={old_spearman:.4f}, CI=[{lower:.4f}, {upper:.4f}])")
+    return decision
 
 
 def set_seed(seed):
@@ -454,7 +670,7 @@ def main():
     np.savez(f"experiments/preds/{IMAGE_ENCODER}_{TEXT_ENCODER}_sim{int(USE_SIM)}_s{SEED}.npz",
              video_id=test_sub["video_id"].values, pred=preds, target=targets)
 
-    export_bundle(
+    versioned_path, latest_path, _bundle = export_bundle(
         checkpoint=checkpoint,
         df=df,
         train_idx=train_idx,
@@ -469,6 +685,21 @@ def main():
             "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx),
         },
     )
+
+    linear_baseline_spearman = _linear_baseline_spearman(df.iloc[train_idx], test_sub)
+    promotion_decision = promote_if_better(
+        versioned_path=versioned_path,
+        latest_path=latest_path,
+        new_preds=preds,
+        targets=targets,
+        linear_baseline_spearman=linear_baseline_spearman,
+        df=df,
+        test_idx=test_idx,
+        image_embeddings=image_embeddings,
+        text_embeddings=text_embeddings,
+        device=device,
+    )
+    _write_airflow_xcom(promotion_decision)
 
 
 if __name__ == "__main__":
