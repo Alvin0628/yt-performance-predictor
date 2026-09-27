@@ -64,4 +64,10 @@ with DAG(
         wait_for_completion=False,
     )
 
-    run_ingestion >> trigger_embed_new
+    trigger_monitor_drift = TriggerDagRunOperator(
+        task_id="trigger_monitor_drift",
+        trigger_dag_id="monitor_drift",
+        wait_for_completion=False,
+    )
+
+    run_ingestion >> [trigger_embed_new, trigger_monitor_drift]

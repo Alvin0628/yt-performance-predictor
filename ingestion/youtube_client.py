@@ -39,11 +39,20 @@ def get_channel_info(channel_ref):
     return channel_id, uploads_playlist_id, subscriber_count
 
 
-def get_video_ids(playlist_id, published_after):
-    """Page through a channel's uploads playlist, stopping once videos predate published_after."""
+def get_video_ids(playlist_id, published_after, mature_before):
+    """Page through a channel's uploads playlist, returning only videos
+    published in [published_after, mature_before] -- i.e. within the
+    overall ingestion window AND already at least LABEL_MATURITY_DAYS old.
+
+    Stops paging entirely once a video predates published_after (everything
+    further back in this reverse-chronological playlist is out of range).
+    A video newer than mature_before is skipped but does NOT stop paging --
+    older, already-mature videos may still follow it in the list.
+    """
     video_ids = []
     page_token = None
-    cutoff = datetime.fromisoformat(published_after.replace("Z", "+00:00"))
+    after_cutoff = datetime.fromisoformat(published_after.replace("Z", "+00:00"))
+    mature_cutoff = datetime.fromisoformat(mature_before.replace("Z", "+00:00"))  # <-- added
 
     while True:
         params = {"part": "contentDetails", "playlistId": playlist_id, "maxResults": 50}
@@ -61,8 +70,10 @@ def get_video_ids(playlist_id, published_after):
             if published_at is None:
                 continue
             pub_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-            if pub_dt < cutoff:
+            if pub_dt < after_cutoff:
                 stop = True
+                continue
+            if pub_dt > mature_cutoff:   # <-- was "mature_before"
                 continue
             video_ids.append(item["contentDetails"]["videoId"])
 
@@ -71,7 +82,6 @@ def get_video_ids(playlist_id, published_after):
             break
 
     return video_ids
-
 
 def get_video_details(video_ids):
     """Batch-fetch full details for up to 50 video IDs at a time."""

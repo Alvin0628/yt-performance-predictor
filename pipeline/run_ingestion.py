@@ -8,7 +8,7 @@ Usage:
 
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -97,14 +97,14 @@ def upsert_dataframe(df, engine, table_name="videos", pk_col="video_id", batch_s
             conn.execute(stmt)
 
 
-def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
+def process_channel(channel_ref, rows, skipped_shorts, finalized_ids, mature_before):
     print(f"Processing {channel_ref}...")
     info = get_channel_info(channel_ref)
     if info is None:
         return
     channel_id, uploads_playlist_id, subscriber_count = info
 
-    video_ids = get_video_ids(uploads_playlist_id, PUBLISHED_AFTER)
+    video_ids = get_video_ids(uploads_playlist_id, PUBLISHED_AFTER, mature_before)
     already_finalized = [v for v in video_ids if v in finalized_ids]
     video_ids = [v for v in video_ids if v not in finalized_ids]
     print(f"  found {len(video_ids) + len(already_finalized)} videos since {PUBLISHED_AFTER} "
@@ -163,11 +163,12 @@ def main():
     existing_df = pd.read_sql(f"SELECT {', '.join(VIDEO_COLUMNS)} FROM videos", engine)
     finalized_ids = set(existing_df.loc[existing_df["label_finalized"] == True, "video_id"])
 
+    mature_before = (datetime.now(timezone.utc) - timedelta(days=LABEL_MATURITY_DAYS)).isoformat()
     rows = []
     skipped_shorts = [0]
     for channel_ref in channels:
         try:
-            process_channel(channel_ref, rows, skipped_shorts, finalized_ids)
+            process_channel(channel_ref, rows, skipped_shorts, finalized_ids, mature_before)
         except Exception as e:
             print(f"  [error] {channel_ref}: {e}")
 
