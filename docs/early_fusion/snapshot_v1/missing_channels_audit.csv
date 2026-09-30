@@ -1,0 +1,17 @@
+handle,status,error,n_non_shorts,n_total,channel_id
+@AdamRagusea,error,"HTTPSConnectionPool(host='www.googleapis.com', port=443): Max retries exceeded with url: /youtube/v3/channels?part=contentDetails%2Cstatistics&forHandle=%40AdamRagusea&key=AIzaSyCoFfUT5ZwnXvsMySl6ukGth9Isd6URF7w (Caused by ConnectTimeoutError(<HTTPSConnection(host='www.googleapis.com', port=443) at 0x19b48f88320>, 'Connection to www.googleapis.com timed out. (connect timeout=None)'))",,,
+@AlexG,channel_not_found,,0.0,,
+@CompanyMan,no_videos_in_window,,0.0,0.0,
+@Empleman,channel_not_found,,0.0,,
+@Garage54,all_shorts,,0.0,1.0,UCsVUEqm10S_K5L1TxtKYz2A
+@Hoog,no_videos_in_window,,0.0,0.0,
+@HowToMakeEverything,no_videos_in_window,,0.0,0.0,
+@Kraut,error,404 Client Error: Not Found for url: https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&playlistId=UU3nfpK0oJdNtohAgwmwHr9Q&maxResults=50&key=AIzaSyCoFfUT5ZwnXvsMySl6ukGth9Isd6URF7w,,,
+@LessonsFromTheScreenplay,no_videos_in_window,,0.0,0.0,
+@MaxMiller,channel_not_found,,0.0,,
+@NikoOmilana,channel_not_found,,0.0,,
+@PracticalEngineering,all_shorts,,0.0,11.0,UCAK3X_yAuxrQo_6q_mzPK8w
+@ProHomeCooks,channel_not_found,,0.0,,
+@TheEngineeringMindset,channel_not_found,,0.0,,
+@TomSka,all_shorts,,0.0,1.0,UCOYWgypDktXdb-HfZnSMK6A
+@jasontheween,all_shorts,,0.0,2.0,UC3Gs5xHzFq3gvv0Qjgxh1SQ
