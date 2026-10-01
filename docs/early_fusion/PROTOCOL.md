@@ -62,3 +62,24 @@ The final snapshot covers **135 channels**.
 - Combined effect: M3 − M0 = +0.0560
 
 **Note:** M0b reached `best_epoch = 200` (did not converge across all seeds), which may indicate that it was under-trained. This is not a blocker for the baseline.
+
+## M4 Ablation Ladder (in progress, seed=42)
+
+Snapshot: c14dba895034fc4c | Split: train=9028, val=1128, test=1129  
+Git SHA at run: b7bd737c, dirty=False  
+M4 Parameters: 587,393
+
+### Val Spearman (temporary, seed=42)
+
+| Variant | Tokens | Val Spearman | Val Loss | Best Epoch |
+|---|---|---|---|---|
+| M4 tabular_only | 13 (CLS+12) | **0.4003** | 0.1928 | 15 |
+| M4 no_image | 45 | *(pending)* | | |
+| M4 no_text | 63 | *(pending)* | | |
+| M4 full | 95 | *(pending)* | | |
+
+### Comparison Baseline (val, same snapshot)
+
+| Model | Val Spearman | Val Loss | Best Epoch |
+|---|---|---|---|
+| M3 late fusion | **0.3337** | 0.2032 | 53 |
