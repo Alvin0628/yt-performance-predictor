@@ -1,85 +1,127 @@
-# Channel Audit (Final)
+# Early Fusion (RATF) — Research Protocol
 
-- **channels.json:** 151 channels
-- **Ingested:** 135 channels
-- **Missing:** 16 channels, all verified via the API (see `missing_channels_audit.csv`)
+Canonical snapshot: `c14dba895034fc4c`  
+N = 11,285 rows, 135 channels  
+Split: train=9,028, val=1,128, test=1,129 (temporal 80/10/10)
 
-## Categories
+---
 
-- **channel_not_found (6):** `@AlexG`, `@Empleman`, `@MaxMiller`, `@NikoOmilana`, `@ProHomeCooks`, `@TheEngineeringMindset` — handles could not be resolved.
+## 1. Dataset
 
-- **no_videos_in_window (4):** `@CompanyMan`, `@Hoog`, `@HowToMakeEverything`, `@LessonsFromTheScreenplay` — no uploads published on or after `2025-01-01`.
+### 1.1 Channel Audit
 
-- **all_shorts (4):** `@Garage54`, `@PracticalEngineering`, `@TomSka`, `@jasontheween` — all uploads are Shorts (≤180 seconds).
+- `channels.json`: 151 channels
+- Ingested: **135 channels**
+- Missing: 16 channels (verified via API, see `missing_channels_audit.csv`)
 
-- **Unresolved errors (2):** `@AdamRagusea`, `@Kraut` — network timeout / playlist 404 errors.
+**Missing categories:**
 
-## Conclusion
+- `channel_not_found` (6): @AlexG, @Empleman, @MaxMiller, @NikoOmilana, @ProHomeCooks, @TheEngineeringMindset
+- `no_videos_in_window` (4): @CompanyMan, @Hoog, @HowToMakeEverything, @LessonsFromTheScreenplay
+- `all_shorts` (4): @Garage54, @PracticalEngineering, @TomSka, @jasontheween
+- Unresolved errors (2): @AdamRagusea (timeout), @Kraut (playlist 404)
 
-No channels failed due to an ingestion bug.
+**Conclusion:** no channels failed due to an ingestion bug. The 16 channels simply had no videos that passed the filtering criteria.
 
-These 16 channels simply have no videos that meet the filtering criteria.
-
-The final snapshot covers **135 channels**.
-
-## Text Token Length (L)
+### 1.2 Text Token Length (L)
 
 - Snapshot: 11,285 titles
 - Distribution: p50=11, p90=19, p95=22, p99=29, max=174
-- Selected L: **32**
-- Rationale: 0.59% of titles are truncated (≤1% threshold), saving ~200 MB of memory vs L=48
-- Longest title: 174 tokens (outlier, still truncated to 32)
+- **L selected: 32** (0.59% of titles truncated, ≤1% threshold, saves ~200 MB vs L=48)
 
-## Thumbnail Size Distribution (all 11.285)
+### 1.3 Thumbnail Size Distribution
 
-- 1280×720 (16:9, maxres): 9.565 (84.8%)
-- 640×480 (4:3, high): 1.710 (15.2%)
-- 480×360 (4:3, medium): 10 (0.1%)
+| Size            | Count | Percentage | Quality |
+| --------------- | ----: | ---------: | ------- |
+| 1280×720 (16:9) | 9,565 |      84.8% | maxres  |
+| 640×480 (4:3)   | 1,710 |      15.2% | high    |
+| 480×360 (4:3)   |    10 |       0.1% | medium  |
+
 - Transform: `squash` → (224, 224), ignoring aspect ratio
 - Mode: RGB for all
 - Note: 15.3% of thumbnails are non-16:9 → different visual distortion when squashed
 
-## M3 Baseline (Late Fusion) — Local Snapshot
+### 1.4 Split Hashes
 
-- Snapshot: c14dba895034fc4c (N=11285)
-- Split: train=9028, val=1128, test=1129
-- Seeds: 42, 43, 44
-- Test Spearman: 0.2957 ± 0.0134
-- Test AUC: 0.6293 ± 0.0064
+- `train_ids_hash`: `adb6377518e6233e`
+- `val_ids_hash`: `1099f7a03511c7ea`
+- `test_ids_hash`: `dccdabc759d22895`
 
-## Baseline Decomposition
+---
 
-| Model | Tabular Features     | Image | Text | Spearman        | AUC    |
-| ----- | -------------------- | ----- | ---- | --------------- | ------ |
-| M0    | 4 features           | ❌    | ❌   | 0.2397 ± 0.0170 | 0.6055 |
-| M0b   | 12 features (+title) | ❌    | ❌   | 0.2323 ± 0.0141 | 0.6114 |
-| M3    | 12 features          | ✅    | ✅   | 0.2957 ± 0.0134 | 0.6293 |
+## 2. Main Baseline (Test Spearman)
 
-**Decomposition:**
+**Comparison baseline for RATF.**
 
-- Effect of 8 title features: M0b − M0 = −0.0074 (not helpful)
-- Effect of image + text: M3 − M0b = +0.0634 (substantial)
-- Combined effect: M3 − M0 = +0.0560
+| Model                          | Val                 | **Test**            | Role                         |
+| ------------------------------ | ------------------- | ------------------- | ---------------------------- |
+| M3 (late fusion, LR 2e-5)      | 0.3337              | 0.2957 ± 0.0134     | Old baseline (under-trained) |
+| **M3′ (late fusion, LR 1e-3)** | **0.3930 ± 0.0130** | **0.3533 ± 0.0152** | **MAIN BASELINE for RATF**   |
 
-**Note:** M0b reached `best_epoch = 200` (did not converge across all seeds), which may indicate that it was under-trained. This is not a blocker for the baseline.
+**Context:** M3 → M3′ increased by +0.058 on test (well above the ±0.013 noise). This confirms that the old baseline was under-trained (LR 2e-5 was too small; M0b stopped at epoch 200).
 
-## M4 Ablation Ladder (in progress, seed=42)
+---
 
-Snapshot: c14dba895034fc4c | Split: train=9028, val=1128, test=1129  
-Git SHA at run: b7bd737c, dirty=False  
-M4 Parameters: 587,393
+## 3. Diagnostic Only (Not a Comparison Baseline)
 
-### Val Spearman (temporary, seed=42)
+These models are **not** targets for RATF, but are reported for context and diagnostics.
 
-| Variant | Tokens | Val Spearman | Val Loss | Best Epoch |
-|---|---|---|---|---|
-| M4 tabular_only | 13 (CLS+12) | **0.4003** | 0.1928 | 15 |
-| M4 no_image | 45 | *(pending)* | | |
-| M4 no_text | 63 | *(pending)* | | |
-| M4 full | 95 | *(pending)* | | |
+### 3.1 Tabular Baselines (Test)
 
-### Comparison Baseline (val, same snapshot)
+| Model                             | Val        | Test       | Notes                         |
+| --------------------------------- | ---------- | ---------- | ----------------------------- |
+| Mean-reversion (-log1p(trailing)) | 0.0998     | 0.1231     | Trivial baseline              |
+| Ridge (alpha=1.0)                 | 0.2313     | 0.1519     | Overfit (val-test gap -0.079) |
+| **GBDT (iter=300, lr=0.05)**      | **0.4414** | **0.4120** | **Tabular ceiling**           |
+| GBDT_large (iter=1000, lr=0.03)   | 0.4580     | 0.3991     | Mild overfitting              |
 
-| Model | Val Spearman | Val Loss | Best Epoch |
-|---|---|---|---|
-| M3 late fusion | **0.3337** | 0.2032 | 53 |
+**GBDT is the tabular ceiling**, not the target. It is reported for discussion: "multimodal does not outperform pure tabular."
+
+### 3.2 MLP Baselines (Test)
+
+| Model | Tabular Features       | Image | Text | Test Spearman   | AUC    |
+| ----- | ---------------------- | ----- | ---- | --------------- | ------ |
+| M0    | 4 features             | ❌    | ❌   | 0.2397 ± 0.0170 | 0.6055 |
+| M0b   | 12 features (+8 title) | ❌    | ❌   | 0.2323 ± 0.0141 | 0.6114 |
+
+**Decomposition of title-feature effect:** M0b − M0 = −0.0074 (within noise, not helpful).
+
+### 3.3 M4 Ablation Ladder (Val, seed=42)
+
+| Variant             | Tokens | Val Spearman | Val AUC | Best Epoch |
+| ------------------- | -----: | -----------: | ------: | ---------: |
+| tabular_only        |     13 |   **0.4003** |  0.6694 |         15 |
+| no_image (tab+text) |     45 |       0.4036 |  0.6830 |         21 |
+| no_text (tab+image) |     63 |       0.3931 |  0.6736 |         14 |
+| **full**            |     95 |   **0.3114** |  0.6368 |      **7** |
+
+**Findings:**
+
+- 2-modality ablations (tabular+text / tabular+image) are healthy: ~0.39–0.40.
+- **Full 3-modality performance drops by -0.09** and stops at epoch 7. **Anomaly in joint training.**
+- **Hypothesis:** attention dilution from 50 image tokens (noisy CLIP patches) + loss of tabular dominance when image+text are added.
+
+---
+
+## 4. RATF Target
+
+**M4/M5/M6 must outperform M3′ test 0.3533.**
+
+- M4 full currently has val = 0.3114 (below M3′ val 0.3930). **Needs improvement.**
+- Potential improvements: M4a (pooled tokens), M5 (cross-attention), M6 (reliability gate).
+- GBDT 0.4120 is reported as the tabular ceiling, **not** the target.
+
+---
+
+## 5. Research Narrative
+
+> "RATF (token-level early fusion) vs M3′ (tuned late fusion) for relative YouTube performance prediction. GBDT 0.4120 is reported as the tabular ceiling, not the comparison target. Question: can token-level interactions between thumbnails, titles, and metadata outperform late fusion?"
+
+---
+
+## 6. Reproducibility
+
+- Snapshot hash: `c14dba895034fc4c`
+- Git SHA M3′: `b7bd737c` (dirty=True at run)
+- All runs on GPU (CUDA)
+- Seed: 42, 43, 44 (M3′), 42 (M4 ladder, preliminary)
