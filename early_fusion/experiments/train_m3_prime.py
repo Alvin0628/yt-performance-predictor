@@ -1,14 +1,18 @@
-"""M3' — late fusion TUNED (adil vs M4).
+"""M3' — late fusion TUNED on canonical temporal split (drop subs).
 
-Perbedaan dari models/train.py asli:
-- Baca dari snapshot.parquet (bukan Postgres) → split identik dengan M4.
-- Split dari kolom `split` (bukan time_based_split yang re-sort).
-- LR 1e-3, AdamW, warmup 5%, grad clip 1.0, EPOCHS 400.
-- Checkpoint per seed, output ke m3_prime_results.jsonl.
-- Verify snapshot hash + split video_id hash + git SHA.
-- Tidak ada promotion gate, tidak ada Airflow XCom (bukan serving candidate).
+Split protocol:
+- Canonical split dari early_fusion/splits/temporal_no_subs.json (temporal).
+- Drop `subscriber_count_at_upload` dari fitur tabular (leakage removal).
+- Split di-load dari file, bukan dihitung ulang. Verifikasi hash.
+- Konsisten dengan M4a/M5/M6 — semua pakai split file yang sama.
 
-Arsitektur LateFusionModel TIDAK diubah — hanya training protocol yang di-tune.
+Perbedaan dari train_m3_prime.py lama:
+- Import dari _common (set_seed, load_snapshot, prepare_tabular_drop_subs).
+- Import dari load_split (load_canonical_split, apply_split_to_df).
+- Drop subs via prepare_tabular_drop_subs.
+- Catat split_mode + drop_subs di JSONL.
+
+Model, training protocol, hyperparameter: IDENTIK.
 """
 import sys
 from pathlib import Path
@@ -18,35 +22,33 @@ if str(ROOT) not in sys.path:
 
 import os
 import json
-import hashlib
-import subprocess
-import random
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from scipy.stats import spearmanr
 from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error,
                               roc_auc_score)
 
-from features.target import compute_target, invert_target
-from models.dataset import (VideoDataset, build_tabular_matrix,
-                             TABULAR_LOG_COLS, TABULAR_NUMERIC_COLS, TABULAR_BOOL_COLS)
+from features.target import invert_target
+from models.dataset import VideoDataset
 from models.late_fusion_model import LateFusionModel
+
+from early_fusion.experiments._common import (
+    set_seed, hash_ids, get_git_info,
+    load_snapshot, prepare_tabular_drop_subs,
+)
+from early_fusion.splits.load_split import load_canonical_split, apply_split_to_df
 
 
 # ==== Config ====
 SEED = int(os.environ.get("SEED", 42))
-SNAPSHOT = Path("data_snapshots/snapshot.parquet")
 SNAPSHOT_HASH = "c14dba895034fc4c"
 
 CHECKPOINT_PATH_TMPL = "early_fusion/models/checkpoints/m3_prime_seed{seed}.pt"
-RESULTS_PATH = "early_fusion/results/m3_prime_results.jsonl"
+RESULTS_PATH = Path("early_fusion/results/m3_prime_results.jsonl")
 
 IMAGE_ENCODER = "clip_b32"
 TEXT_ENCODER = "clip"
-IMAGE_MODE = "squash"
-CLIP_TEXT_MODEL = "openai/clip-vit-base-patch32"
 
 BATCH_SIZE = 64
 EPOCHS = 400
@@ -57,52 +59,6 @@ EMBEDDING_NOISE_STD = 0.02
 EARLY_STOP_PATIENCE = 15
 WARMUP_FRAC = 0.05
 GRAD_CLIP = 1.0
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def parse_vector(s):
-    if isinstance(s, str):
-        return np.fromstring(s.strip("[]"), sep=",", dtype=np.float32)
-    return np.asarray(s, dtype=np.float32)
-
-
-def hash_df(df):
-    h = hashlib.sha256()
-    h.update(pd.util.hash_pandas_object(df, index=True).values.tobytes())
-    return h.hexdigest()[:16]
-
-
-def hash_ids(ids):
-    return hashlib.sha256(",".join(sorted(map(str, ids))).encode()).hexdigest()[:16]
-
-
-def get_git_info():
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-        dirty = subprocess.check_output(["git", "status", "--porcelain"]).decode().strip()
-        return sha, bool(dirty)
-    except Exception:
-        return "unknown", False
-
-
-def load_data_from_snapshot():
-    df = pd.read_parquet(SNAPSHOT)
-    computed = hash_df(df)
-    print(f"snapshot: {len(df)} rows, hash={computed}")
-    assert computed == SNAPSHOT_HASH, \
-        f"snapshot hash mismatch: {computed} vs {SNAPSHOT_HASH}"
-
-    image_embeddings = np.stack(df["image_embedding"].apply(parse_vector).values)
-    text_embeddings = np.stack(df["text_embedding"].apply(parse_vector).values)
-    df = df.drop(columns=["image_embedding", "text_embedding"]).reset_index(drop=True)
-    df["target"] = compute_target(df["views"], df["trailing_avg_views"])
-    return df, image_embeddings, text_embeddings
 
 
 def train_epoch(model, loader, optimizer, scheduler, loss_fn, device):
@@ -148,34 +104,29 @@ def main():
     print(f"git: {git_sha[:8]} dirty={git_dirty}")
     print(f"seed={SEED}, lr={LEARNING_RATE}, epochs={EPOCHS}, "
           f"batch={BATCH_SIZE}, warmup={WARMUP_FRAC}, grad_clip={GRAD_CLIP}")
+    print(f"split_mode: temporal_no_subs, drop_subs: True")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    df, image_embeddings, text_embeddings = load_data_from_snapshot()
+    # ---------- Load snapshot ----------
+    df, image_embeddings, text_embeddings = load_snapshot()
 
-    # Split dari kolom `split` (bukan time_based_split yang re-sort)
-    train_idx = np.where(df["split"].values == "train")[0]
-    val_idx = np.where(df["split"].values == "val")[0]
-    test_idx = np.where(df["split"].values == "test")[0]
+    # ---------- Load canonical split ----------
+    split = load_canonical_split(verbose=True)
+    train_idx, val_idx, test_idx = apply_split_to_df(df, split)
     print(f"split: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
 
     split_hashes = {
-        "train_ids_hash": hash_ids(df.iloc[train_idx]["video_id"].tolist()),
-        "val_ids_hash": hash_ids(df.iloc[val_idx]["video_id"].tolist()),
-        "test_ids_hash": hash_ids(df.iloc[test_idx]["video_id"].tolist()),
+        "train_ids_hash": split["train_ids_hash"],
+        "val_ids_hash": split["val_ids_hash"],
+        "test_ids_hash": split["test_ids_hash"],
     }
-    print(f"split hashes: {split_hashes}")
 
-    genre_categories = sorted(df.iloc[train_idx]["genre"].dropna().unique().tolist())
+    # ---------- Build tabular features (drop subs) ----------
+    train_tab, val_tab, test_tab, scaler, genre_categories, tabular_dim = \
+        prepare_tabular_drop_subs(df, train_idx, val_idx, test_idx)
     print(f"n_genres: {len(genre_categories)}")
-
-    train_tabular, scaler = build_tabular_matrix(
-        df.iloc[train_idx], genre_categories, fit_scaler=True)
-    val_tabular, _ = build_tabular_matrix(
-        df.iloc[val_idx], genre_categories, scaler=scaler)
-    test_tabular, _ = build_tabular_matrix(
-        df.iloc[test_idx], genre_categories, scaler=scaler)
 
     def make_dataset(idx, tabular):
         sub = df.iloc[idx]
@@ -184,18 +135,19 @@ def main():
             sub["target"].values, sub["video_id"].values,
         )
 
-    train_ds = make_dataset(train_idx, train_tabular)
-    val_ds = make_dataset(val_idx, val_tabular)
-    test_ds = make_dataset(test_idx, test_tabular)
+    train_ds = make_dataset(train_idx, train_tab)
+    val_ds = make_dataset(val_idx, val_tab)
+    test_ds = make_dataset(test_idx, test_tab)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, num_workers=0)
 
+    # ---------- Model ----------
     model = LateFusionModel(
         image_dim=image_embeddings.shape[1],
         text_dim=text_embeddings.shape[1],
-        tabular_dim=train_tabular.shape[1],
+        tabular_dim=tabular_dim,
         dropout=DROPOUT,
         embedding_noise_std=EMBEDDING_NOISE_STD,
     ).to(device)
@@ -203,6 +155,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable params: {n_params:,}")
 
+    # ---------- Optimizer ----------
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
                                    weight_decay=WEIGHT_DECAY)
     total_steps = len(train_loader) * EPOCHS
@@ -219,9 +172,9 @@ def main():
     checkpoint_path = CHECKPOINT_PATH_TMPL.format(seed=SEED)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
+    # ---------- Training loop ----------
     best_val_loss = float("inf")
     best_epoch = None
-    best_val_spearman = None
     epochs_without_improvement = 0
 
     for epoch in range(1, EPOCHS + 1):
@@ -232,7 +185,6 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            best_val_spearman = val_spearman
             epochs_without_improvement = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
@@ -240,7 +192,7 @@ def main():
                 "scaler": scaler,
                 "image_dim": image_embeddings.shape[1],
                 "text_dim": text_embeddings.shape[1],
-                "tabular_dim": train_tabular.shape[1],
+                "tabular_dim": tabular_dim,
                 "epoch": epoch,
                 "val_loss": val_loss,
                 "val_spearman_raw": val_spearman,
@@ -248,6 +200,8 @@ def main():
                 "text_encoder": TEXT_ENCODER,
                 "seed": SEED,
                 "snapshot_hash": SNAPSHOT_HASH,
+                "split_mode": "temporal_no_subs",
+                "drop_subs": True,
                 "split_hashes": split_hashes,
                 "git_sha": git_sha,
                 "git_dirty": git_dirty,
@@ -260,11 +214,11 @@ def main():
                 print(f"early stop ep {epoch}")
                 break
 
-    # Load best checkpoint
+    # ---------- Load best checkpoint ----------
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    # Val metrics (best checkpoint)
+    # ---------- Val metrics ----------
     _, val_preds, val_targets = evaluate(model, val_loader, loss_fn, device)
     val_sp = spearmanr(val_preds, val_targets)[0]
     has_both = len(np.unique((val_targets > 0).astype(int))) == 2
@@ -276,9 +230,7 @@ def main():
     print(f"val AUC:      {val_auc:.4f}")
     print(f"best epoch:   {checkpoint['epoch']}, params: {n_params:,}")
 
-    # Test metrics (buka 1x setelah config beku)
-    # Untuk M3', test tetap dihitung karena tujuan: bandingkan angka
-    # test M3 asli dengan M3' tuned. Ini yang pertama dan terakhir.
+    # ---------- Test metrics ----------
     test_loss, test_preds, test_targets = evaluate(model, test_loader, loss_fn, device)
     test_sp = spearmanr(test_preds, test_targets)[0]
     has_both_t = len(np.unique((test_targets > 0).astype(int))) == 2
@@ -296,12 +248,14 @@ def main():
     print(f"test AUC:      {test_auc:.4f}")
     print(f"test MAE (target): {test_mae_target:.4f}")
 
-    # Simpan hasil
-    os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
+    # ---------- Save results ----------
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_PATH, "a") as f:
         f.write(json.dumps({
             "model": "M3_prime_late_fusion_tuned",
             "seed": SEED,
+            "split_mode": "temporal_no_subs",
+            "drop_subs": True,
             "val_spearman": float(val_sp),
             "val_auc": float(val_auc),
             "val_loss": float(checkpoint["val_loss"]),
