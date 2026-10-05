@@ -1,0 +1,42 @@
+{
+  "tag": "confirm_c6",
+  "cfg_hash": "0a9f7ea362fb2760",
+  "variant": "full",
+  "fit": "train",
+  "seeds": [
+    44,
+    45,
+    46
+  ],
+  "cfg": {
+    "d": 192,
+    "num_layers": 3,
+    "cross_attn_layers": 2,
+    "ff_mult": 2,
+    "dropout": 0.17458146584230055,
+    "emb_noise": 0.1120152621609839,
+    "mod_dropout": 0.19775153112453842,
+    "gate_mode": "sigmoid2",
+    "gate_dropout": 0.0,
+    "gate_lr_mult": 30.0,
+    "lr": 0.00025055818982811623,
+    "weight_decay": 0.010242477375317747,
+    "batch_size": 64,
+    "grad_clip": 1.0,
+    "schedule": "const",
+    "epochs": 60,
+    "patience": 15,
+    "warmup_epochs": 0.7,
+    "lr_min_frac": 0.01,
+    "ema_decay": 0.99,
+    "rank_lambda": 0.4
+  },
+  "val_spearman_mean": 0.36053554183468445,
+  "val_spearman_std": 0.046562551556534805,
+  "val_spearman_ensemble": 0.38511534923388274,
+  "best_epochs": [
+    5,
+    6,
+    7
+  ]
+}

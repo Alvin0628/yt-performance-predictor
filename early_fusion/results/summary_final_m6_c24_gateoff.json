@@ -1,0 +1,51 @@
+{
+  "tag": "final_m6_c24_gateoff",
+  "cfg_hash": "d0d0ca3e9a6d0740",
+  "variant": "full",
+  "fit": "train",
+  "seeds": [
+    100,
+    101,
+    102,
+    103,
+    104
+  ],
+  "cfg": {
+    "d": 192,
+    "num_layers": 3,
+    "cross_attn_layers": 2,
+    "ff_mult": 2,
+    "dropout": 0.07893573217275765,
+    "emb_noise": 0.1044028039976821,
+    "mod_dropout": 0.08691696230188581,
+    "gate_mode": "sigmoid2",
+    "gate_dropout": 0.1,
+    "gate_lr_mult": 0,
+    "lr": 0.0002786501522196209,
+    "weight_decay": 0.01673939258862265,
+    "batch_size": 64,
+    "grad_clip": 1.0,
+    "schedule": "const",
+    "epochs": 60,
+    "patience": 15,
+    "warmup_epochs": 0.7,
+    "lr_min_frac": 0.01,
+    "ema_decay": 0.0,
+    "rank_lambda": 0.0
+  },
+  "val_spearman_mean": 0.39253052251545906,
+  "val_spearman_std": 0.02484099387650546,
+  "val_spearman_ensemble": 0.4456369026849119,
+  "best_epochs": [
+    8,
+    14,
+    6,
+    6,
+    8
+  ],
+  "test_spearman_mean": 0.3725178402896941,
+  "test_spearman_std": 0.01465294057015109,
+  "test_spearman_ensemble": 0.4297071322300308,
+  "test_auc_ensemble": 0.6949962783296117,
+  "test_mae_ensemble": 0.45778393745422363
+}

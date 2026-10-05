@@ -1,0 +1,65 @@
+{
+  "name": "m6_granular_ensemble_v1",
+  "file": "m6_granular_ensemble_v1.pt",
+  "sha256": "128e6b2d1e2aff7514dfb434da34db33d8d1c7caa73582a127036631599b07b9",
+  "size_mb": 60.39,
+  "created_at": "2026-10-05 15:30:25",
+  "model_class": "RATF_M6_Granular_V2",
+  "format_version": 1,
+  "n_members": 5,
+  "member_seeds": [
+    100,
+    101,
+    102,
+    103,
+    104
+  ],
+  "params_per_member": 3002608,
+  "variant": "full",
+  "trained_on": "train+val",
+  "cfg": {
+    "d": 192,
+    "num_layers": 3,
+    "cross_attn_layers": 2,
+    "ff_mult": 2,
+    "dropout": 0.07893573217275765,
+    "emb_noise": 0.1044028039976821,
+    "mod_dropout": 0.08691696230188581,
+    "gate_mode": "sigmoid2",
+    "gate_dropout": 0.1,
+    "gate_lr_mult": 0,
+    "lr": 0.0002786501522196209,
+    "weight_decay": 0.01673939258862265,
+    "batch_size": 64,
+    "grad_clip": 1.0,
+    "schedule": "const",
+    "epochs": 60,
+    "patience": 15,
+    "warmup_epochs": 0.7,
+    "lr_min_frac": 0.01,
+    "ema_decay": 0.0,
+    "rank_lambda": 0.0
+  },
+  "split_hashes": {
+    "train_ids_hash": "adb6377518e6233e",
+    "val_ids_hash": "1099f7a03511c7ea",
+    "test_ids_hash": "dccdabc759d22895"
+  },
+  "snapshot_hash": "c14dba895034fc4c",
+  "git_sha": "f4c8ef7f84a1d6f3312da1726b098947e8d9f780",
+  "source_tag": "refit_m6_c24_gateoff",
+  "refit_metrics": {
+    "seeds": [
+      100,
+      101,
+      102,
+      103,
+      104
+    ],
+    "test_spearman_mean": 0.3790702719542425,
+    "test_spearman_std": 0.011077358151902108,
+    "test_spearman_ensemble": 0.431309593755561,
+    "test_auc_ensemble": 0.6898950232283565,
+    "test_mae_ensemble": 0.4757979214191437
+  }
+}

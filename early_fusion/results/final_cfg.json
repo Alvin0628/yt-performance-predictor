@@ -1,0 +1,23 @@
+{
+  "d": 192,
+  "num_layers": 3,
+  "cross_attn_layers": 2,
+  "ff_mult": 2,
+  "dropout": 0.07893573217275765,
+  "emb_noise": 0.1044028039976821,
+  "mod_dropout": 0.08691696230188581,
+  "gate_mode": "sigmoid2",
+  "gate_dropout": 0.1,
+  "gate_lr_mult": 10.0,
+  "lr": 0.0002786501522196209,
+  "weight_decay": 0.01673939258862265,
+  "batch_size": 64,
+  "grad_clip": 1.0,
+  "schedule": "const",
+  "epochs": 60,
+  "patience": 15,
+  "warmup_epochs": 0.7,
+  "lr_min_frac": 0.01,
+  "ema_decay": 0.0,
+  "rank_lambda": 0.0
+}
