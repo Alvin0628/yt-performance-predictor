@@ -1,35 +1,54 @@
 """
-FastAPI wrapper around serving.bundle.LoadedBundle.
+FastAPI wrapper around a model bundle.
 
-Loads the model bundle once at process startup (lifespan, not the deprecated
-on_event hooks) and serves it from memory for every request -- no
-per-request reload.
+Loads the bundle once at process startup (lifespan) and serves it from memory.
+Two backends, chosen automatically from the file at MODEL_BUNDLE_PATH:
+  * early-fusion RATF ensemble  (file has model_class == "RATF_M6_Granular_V2")
+  * late-fusion bundle          (everything else; the original serving.bundle.LoadedBundle)
+Rolling back is therefore just pointing MODEL_BUNDLE_PATH at the old bundle.
 
 Run locally:
     uvicorn serving.app:app --host 0.0.0.0 --port 8000
 """
 
+import io
 import logging
 import os
 from contextlib import asynccontextmanager
 
+import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
-
-from serving.bundle import LoadedBundle
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("serving")
 
 BUNDLE_PATH = os.environ.get("MODEL_BUNDLE_PATH", "models/bundles/latest_clip_b32_clip.pt")
+RATF_MODEL_CLASS = "RATF_M6_Granular_V2"
 
 _bundle_holder = {}
+
+
+def _is_ratf_file(path):
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        return isinstance(blob, dict) and blob.get("model_class") == RATF_MODEL_CLASS
+    finally:
+        del blob
+
+
+def load_backend(path):
+    if _is_ratf_file(path):
+        from serving.ratf_bundle import LoadedRatfBundle
+        return LoadedRatfBundle(path)
+    from serving.bundle import LoadedBundle
+    return LoadedBundle(path)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Loading model bundle from %s", BUNDLE_PATH)
-    _bundle_holder["bundle"] = LoadedBundle(BUNDLE_PATH)
+    _bundle_holder["bundle"] = load_backend(BUNDLE_PATH)
     logger.info(
         "Bundle loaded: version=%s train_end=%s",
         _bundle_holder["bundle"].bundle["version"],
@@ -42,7 +61,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="yt-performance-predictor", lifespan=lifespan)
 
 
-def get_bundle() -> LoadedBundle:
+def get_bundle():
     bundle = _bundle_holder.get("bundle")
     if bundle is None:
         # Shouldn't happen outside of tests that bypass lifespan.
@@ -64,16 +83,20 @@ def health():
 async def predict(
     thumbnail: UploadFile = File(...),
     title: str = Form(...),
-    subscriber_count_at_upload: float = Form(...),
     trailing_avg_views: float = Form(...),
     duration_seconds: float = Form(...),
     genre: str = Form(...),
+    # Required only by the late-fusion bundle; the early-fusion model does not use it.
+    subscriber_count_at_upload: float | None = Form(None),
 ):
     bundle = get_bundle()
 
+    if getattr(bundle, "uses_subscribers", True) and subscriber_count_at_upload is None:
+        raise HTTPException(status_code=422, detail="subscriber_count_at_upload is required by this model")
+
     raw = await thumbnail.read()
     try:
-        image = Image.open(__import__("io").BytesIO(raw))
+        image = Image.open(io.BytesIO(raw))
         image.load()  # force decode now, not lazily inside bundle.predict()
     except UnidentifiedImageError:
         raise HTTPException(status_code=422, detail="thumbnail is not a readable image")
@@ -89,7 +112,6 @@ async def predict(
         )
     except ValueError as e:
         # build_tabular_row raises ValueError for bundle/request mismatches
-        # (missing clip_sim, unexpected clip_sim, missing feature columns).
         raise HTTPException(status_code=400, detail=str(e))
 
     return result

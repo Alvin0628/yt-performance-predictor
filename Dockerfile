@@ -21,8 +21,13 @@ RUN pip install --no-cache-dir -r requirements-serve.txt
 # Only what serving/ actually needs at import time -- no data/, notebooks,
 # ingestion/, Airflow DAGs, or training-only requirements.
 COPY serving/ serving/
-COPY models/late_fusion_model.py models/precompute_embeddings.py models/
+COPY models/late_fusion_model.py models/precompute_embeddings.py models/dataset.py models/
 COPY features/ features/
+# Early-fusion (RATF) inference code only: model classes + CLIP token extractor.
+# Deliberately NOT the whole early_fusion/ tree (results, 60 MB bundle, experiments).
+COPY early_fusion/__init__.py early_fusion/
+COPY early_fusion/models/*.py early_fusion/models/
+COPY early_fusion/datasets/__init__.py early_fusion/datasets/clip_tokens.py early_fusion/datasets/
 
 RUN python -c "from transformers import CLIPModel, AutoTokenizer; \
 CLIPModel.from_pretrained('openai/clip-vit-base-patch32'); \

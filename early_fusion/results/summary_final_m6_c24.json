@@ -1,0 +1,51 @@
+{
+  "tag": "final_m6_c24",
+  "cfg_hash": "cd5ec2cb143868b9",
+  "variant": "full",
+  "fit": "train",
+  "seeds": [
+    100,
+    101,
+    102,
+    103,
+    104
+  ],
+  "cfg": {
+    "d": 192,
+    "num_layers": 3,
+    "cross_attn_layers": 2,
+    "ff_mult": 2,
+    "dropout": 0.07893573217275765,
+    "emb_noise": 0.1044028039976821,
+    "mod_dropout": 0.08691696230188581,
+    "gate_mode": "sigmoid2",
+    "gate_dropout": 0.1,
+    "gate_lr_mult": 10.0,
+    "lr": 0.0002786501522196209,
+    "weight_decay": 0.01673939258862265,
+    "batch_size": 64,
+    "grad_clip": 1.0,
+    "schedule": "const",
+    "epochs": 60,
+    "patience": 15,
+    "warmup_epochs": 0.7,
+    "lr_min_frac": 0.01,
+    "ema_decay": 0.0,
+    "rank_lambda": 0.0
+  },
+  "val_spearman_mean": 0.3808566087947459,
+  "val_spearman_std": 0.013501317608992343,
+  "val_spearman_ensemble": 0.4289015847479753,
+  "best_epochs": [
+    6,
+    6,
+    6,
+    6,
+    7
+  ],
+  "test_spearman_mean": 0.34696325072934686,
+  "test_spearman_std": 0.017022391729280023,
+  "test_spearman_ensemble": 0.39836134839885606,
+  "test_auc_ensemble": 0.6802988886322219,
+  "test_mae_ensemble": 0.4642897844314575
+}

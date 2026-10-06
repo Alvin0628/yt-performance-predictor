@@ -17,3 +17,14 @@ airflow_password_caller.txt
 pipeline/migrate_dataset_to_postgres.py
 pipeline/migrate_thumbnails_to_minio.py
 ARM_activation.md
+
+# --- M6: artifact
+*.db
+*.npz
+data_snapshots/
+early_fusion/models/checkpoints/
+early_fusion/results/preds/
+early_fusion/results/optuna_old/
+early_fusion/results/summary_smoke*.json
+early_fusion/results/summary_speedtest.json
+early_fusion/models/final/*.pt

@@ -1,0 +1,3 @@
+{"time": "2026-10-05 10:43:34", "role": "m6_final", "cfg_hash": "cd5ec2cb143868b9", "tag": "final_m6_c24", "seeds": [100, 101, 102, 103, 104]}
+{"time": "2026-10-05 11:05:36", "role": "m6_gateoff", "cfg_hash": "d0d0ca3e9a6d0740", "tag": "final_m6_c24_gateoff", "seeds": [100, 101, 102, 103, 104]}
+{"time": "2026-10-05 15:29:57", "role": "m6_refit", "cfg_hash": "ea9eafc5d2062447", "tag": "refit_m6_c24_gateoff", "seeds": [100, 101, 102, 103, 104]}
