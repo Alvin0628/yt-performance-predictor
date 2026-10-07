@@ -18,22 +18,18 @@ from sklearn.preprocessing import StandardScaler
 
 from models.dataset import (build_tabular_matrix, TABULAR_LOG_COLS,
                              TABULAR_NUMERIC_COLS, TABULAR_BOOL_COLS)
+from early_fusion.data_spec import DEFAULT_SPEC, hash_df   # hash_df re-exported for old callers
 
 
-SNAPSHOT = Path("data_snapshots/snapshot.parquet")
-SNAPSHOT_HASH = "c14dba895034fc4c"
+# Kept for old callers; the values now come from DEFAULT_SPEC.
+SNAPSHOT = DEFAULT_SPEC.snapshot_path
+SNAPSHOT_HASH = DEFAULT_SPEC.snapshot_hash
 
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def hash_df(df):
-    h = hashlib.sha256()
-    h.update(pd.util.hash_pandas_object(df, index=True).values.tobytes())
-    return h.hexdigest()[:16]
 
 
 def hash_ids(ids):
@@ -55,25 +51,38 @@ def parse_vector(s):
     return np.asarray(s, dtype=np.float32)
 
 
-def load_snapshot(verbose=True):
+def load_snapshot(verbose=True, spec=None, load_embeddings=True):
     """Load snapshot + verify hash. Return (df, image_emb, text_emb).
 
-    df sudah punya kolom 'target' (log ratio views vs trailing).
-    """
-    from features.target import compute_target   # ← tambah import
+    df sudah punya kolom 'target' (log ratio views vs trailing) dan df.attrs["snapshot_hash"]
+    (hash yang dihitung dari file).
 
-    df = pd.read_parquet(SNAPSHOT)
+    spec=None -> DEFAULT_SPEC (perilaku lama: file dan hash tetap).
+    spec.snapshot_hash=None -> hash tidak dibandingkan dengan nilai tetap.
+    load_embeddings=False -> lewati parsing vektor embedding (M6 tidak memakainya);
+    image_emb dan text_emb dikembalikan sebagai None.
+    """
+    from features.target import compute_target
+
+    spec = spec or DEFAULT_SPEC
+    df = pd.read_parquet(spec.snapshot_path)
     computed = hash_df(df)
     if verbose:
         print(f"snapshot: {len(df)} rows, hash={computed}")
-    assert computed == SNAPSHOT_HASH, \
-        f"snapshot hash mismatch: {computed} vs {SNAPSHOT_HASH}"
+    if spec.snapshot_hash is not None:
+        assert computed == spec.snapshot_hash, \
+            f"snapshot hash mismatch: {computed} vs {spec.snapshot_hash}"
 
-    image_emb = np.stack(df["image_embedding"].apply(parse_vector).values)
-    text_emb = np.stack(df["text_embedding"].apply(parse_vector).values)
-    df = df.drop(columns=["image_embedding", "text_embedding"]).reset_index(drop=True)
+    if load_embeddings:
+        image_emb = np.stack(df["image_embedding"].apply(parse_vector).values)
+        text_emb = np.stack(df["text_embedding"].apply(parse_vector).values)
+    else:
+        image_emb = text_emb = None
+    drop = [c for c in ("image_embedding", "text_embedding") if c in df.columns]
+    df = df.drop(columns=drop).reset_index(drop=True)
 
-    df["target"] = compute_target(df["views"], df["trailing_avg_views"])   # ← TAMBAH INI
+    df["target"] = compute_target(df["views"], df["trailing_avg_views"])
+    df.attrs["snapshot_hash"] = computed
 
     return df, image_emb, text_emb
 

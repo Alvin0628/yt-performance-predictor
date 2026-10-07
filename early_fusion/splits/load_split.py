@@ -5,28 +5,38 @@ Dipakai di semua training M3'/M4a/M5/M6 supaya split konsisten.
 import json
 from pathlib import Path
 
-
-SPLIT_FILE = Path("early_fusion/splits/temporal_no_subs.json")
-SNAPSHOT_HASH = "c14dba895034fc4c"
+from early_fusion.data_spec import DEFAULT_SPEC
 
 
-def load_canonical_split(verbose=True):
+# Kept for old callers; the values now come from DEFAULT_SPEC.
+SPLIT_FILE = Path(DEFAULT_SPEC.split_file)
+SNAPSHOT_HASH = DEFAULT_SPEC.snapshot_hash
+
+
+def load_canonical_split(verbose=True, spec=None):
     """Return dict: {train_ids, val_ids, test_ids, train_ids_hash, ...}.
     Raise kalau snapshot hash mismatch.
+
+    spec=None -> DEFAULT_SPEC (perilaku lama). Kalau spec.snapshot_hash None, pencocokan
+    hash dilakukan oleh pemanggil terhadap hash snapshot yang dihitung.
     """
-    if not SPLIT_FILE.exists():
+    spec = spec or DEFAULT_SPEC
+    split_file = Path(spec.split_file)
+    if not split_file.exists():
         raise FileNotFoundError(
             f"Split file belum dibuat. Jalankan: "
             f"python -m early_fusion.splits.create_temporal_split"
         )
 
-    split = json.loads(SPLIT_FILE.read_text())
-    assert split["snapshot_hash"] == SNAPSHOT_HASH, \
-    f"Split dibuat untuk snapshot {split['snapshot_hash']}, "
-    f"tapi sekarang {SNAPSHOT_HASH}"
+    split = json.loads(split_file.read_text())
+    if spec.snapshot_hash is not None:
+        assert split["snapshot_hash"] == spec.snapshot_hash, (
+            f"Split dibuat untuk snapshot {split['snapshot_hash']}, "
+            f"tapi sekarang {spec.snapshot_hash}"
+        )
 
     if verbose:
-        print(f"loaded split: {SPLIT_FILE}")
+        print(f"loaded split: {split_file}")
         print(f"  mode: {split['split_mode']}")
         print(f"  drop_columns: {split['drop_columns']}")
         print(f"  n_train={split['n_train']} n_val={split['n_val']} n_test={split['n_test']}")

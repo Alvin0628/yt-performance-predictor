@@ -15,12 +15,16 @@ import hashlib
 import subprocess
 from datetime import datetime, timezone
 
+import argparse
+
 import numpy as np
 import pandas as pd
 
+from early_fusion.data_spec import DEFAULT_SPEC, hash_df
 
-SNAPSHOT = Path("data_snapshots/snapshot.parquet")
-SNAPSHOT_HASH = "c14dba895034fc4c"
+
+SNAPSHOT = Path(DEFAULT_SPEC.snapshot_path)
+SNAPSHOT_HASH = DEFAULT_SPEC.snapshot_hash
 OUT_DIR = Path("early_fusion/splits")
 OUT_FILE = OUT_DIR / "temporal_no_subs.json"
 
@@ -38,22 +42,16 @@ def get_git_info():
         return "unknown", False
 
 
-def main():
-    df = pd.read_parquet(SNAPSHOT)
-    print(f"loaded snapshot: {len(df)} rows")
-
+def build_split(df, snapshot_hash):
+    """Split manifest from the snapshot's own 'split' column (assigned at export time)."""
     train_ids = df.loc[df["split"] == "train", "video_id"].tolist()
     val_ids = df.loc[df["split"] == "val", "video_id"].tolist()
     test_ids = df.loc[df["split"] == "test", "video_id"].tolist()
 
-    print(f"train: {len(train_ids)} videos")
-    print(f"val:   {len(val_ids)} videos")
-    print(f"test:  {len(test_ids)} videos")
-
     git_sha, git_dirty = get_git_info()
 
-    split_data = {
-        "snapshot_hash": SNAPSHOT_HASH,
+    return {
+        "snapshot_hash": snapshot_hash,
         "split_mode": "temporal_no_subs",
         "drop_columns": ["subscriber_count_at_upload"],
         "n_total": len(df),
@@ -71,10 +69,29 @@ def main():
         "git_dirty": git_dirty,
     }
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_FILE.write_text(json.dumps(split_data, indent=2))
-    print(f"\nsaved: {OUT_FILE}")
-    print(f"split hashes:")
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--snapshot", default=str(SNAPSHOT))
+    ap.add_argument("--snapshot-hash", default=SNAPSHOT_HASH,
+                    help="hash yang dicatat di split; 'auto' = hitung dari file")
+    ap.add_argument("--out", default=str(OUT_FILE))
+    args = ap.parse_args(argv)
+
+    df = pd.read_parquet(args.snapshot)
+    print(f"loaded snapshot: {len(df)} rows")
+    snapshot_hash = hash_df(df) if args.snapshot_hash == "auto" else args.snapshot_hash
+
+    split_data = build_split(df, snapshot_hash)
+    print(f"train: {split_data['n_train']} videos")
+    print(f"val:   {split_data['n_val']} videos")
+    print(f"test:  {split_data['n_test']} videos")
+
+    out_file = Path(args.out)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(json.dumps(split_data, indent=2))
+    print(f"\nsaved: {out_file}")
+    print("split hashes:")
     print(f"  train: {split_data['train_ids_hash']}")
     print(f"  val:   {split_data['val_ids_hash']}")
     print(f"  test:  {split_data['test_ids_hash']}")

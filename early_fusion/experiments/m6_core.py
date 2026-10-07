@@ -56,10 +56,12 @@ from early_fusion.datasets.token_cache import load_cache
 from early_fusion.models.ratf_m6_granular_v2 import RATF_M6_Granular_V2
 from early_fusion.experiments._common import set_seed, get_git_info, load_snapshot
 from early_fusion.splits.load_split import load_canonical_split, apply_split_to_df
+from early_fusion.data_spec import DEFAULT_SPEC
 
 
-SNAPSHOT_HASH = "c14dba895034fc4c"
-CACHE_DIR = "data_snapshots/token_cache"
+# Kept for old callers; the values now come from DEFAULT_SPEC.
+SNAPSHOT_HASH = DEFAULT_SPEC.snapshot_hash
+CACHE_DIR = Path(DEFAULT_SPEC.cache_dir).as_posix()
 SUBS_IDX = 0
 N_IMAGE_TOKENS = 50
 N_TEXT_TOKENS = 32
@@ -140,12 +142,19 @@ def iterate_batches(store, idx, bs, device, shuffle=False, gen=None):
         )
 
 
-def load_data(verbose=True):
-    """Muat snapshot + canonical temporal_no_subs split + token cache. Dipanggil sekali."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    df, _, _ = load_snapshot(verbose=verbose)
+def load_data(verbose=True, spec=None):
+    """Muat snapshot + canonical temporal_no_subs split + token cache. Dipanggil sekali.
 
-    split = load_canonical_split(verbose=verbose)
+    spec=None -> DEFAULT_SPEC (snapshot, split, cache yang tetap seperti sebelumnya).
+    """
+    spec = spec or DEFAULT_SPEC
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    df, _, _ = load_snapshot(verbose=verbose, spec=spec, load_embeddings=False)
+    snap_hash = df.attrs["snapshot_hash"]
+
+    split = load_canonical_split(verbose=verbose, spec=spec)
+    assert split["snapshot_hash"] == snap_hash, \
+        f"split dibuat untuk snapshot {split['snapshot_hash']}, snapshot sekarang {snap_hash}"
     train_idx, val_idx, test_idx = apply_split_to_df(df, split)
     if verbose:
         print(f"split: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
@@ -168,9 +177,9 @@ def load_data(verbose=True):
     genre_to_idx = {g: i + 1 for i, g in enumerate(genres_train)}
     genre_idx = np.array([genre_to_idx.get(g, 0) for g in df["genre"].fillna("")], dtype=np.int64)
 
-    img_tokens, txt_tokens, txt_mask, _thumb_ok, index_df, cache_meta = load_cache(CACHE_DIR)
+    img_tokens, txt_tokens, txt_mask, _thumb_ok, index_df, cache_meta = load_cache(spec.cache_dir)
     assert (index_df["video_id"].values == df["video_id"].values).all()
-    assert cache_meta["snapshot_hash"] == SNAPSHOT_HASH
+    assert cache_meta["snapshot_hash"] == snap_hash
 
     targets = df["target"].values.astype(np.float32)
 
@@ -185,6 +194,7 @@ def load_data(verbose=True):
         n_cont=n_cont, n_genres=n_genres_with_unk,
         scaler=scaler, genres_train=genres_train,
         split_hashes=split_hashes, git_sha=git_sha, git_dirty=git_dirty,
+        snapshot_hash=snap_hash, spec=spec,
     )
 
 
