@@ -77,6 +77,21 @@ MOUNTS = [
     Mount(source=f"{HOST_PROJECT_DIR}/experiments", target="/app/experiments", type="bind"),
 ]
 
+def _restart_api(logger):
+    """Restart the api container so it loads the newly promoted bundle.
+    Found by its compose label, so it doesn't depend on the project name."""
+    import docker
+
+    client = docker.from_env()
+    containers = client.containers.list(
+        filters={"label": "com.docker.compose.service=api"}
+    )
+    if not containers:
+        raise RuntimeError("no running container with compose service label 'api'")
+    for c in containers:
+        logger.info("Restarting %s so it loads the promoted bundle", c.name)
+        c.restart(timeout=30)
+
 with DAG(
     dag_id="train_model",
     description="Retrain the late-fusion model on all embedded rows",
@@ -141,6 +156,7 @@ with DAG(
                 promotion_decision.get("reason"),
                 promotion_decision.get("new_spearman", float("nan")),
             )
+            _restart_api(logger)
         else:
             # Deliberately a warning, not a raised exception -- a rejected
             # promotion is expected behavior, not a task failure. Raising here
