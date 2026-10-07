@@ -1,6 +1,7 @@
 """Check the 16 channels missing from Postgres: determine whether they have videos
 that pass the filters (>= 2025-01-01, non-Shorts, >= 28 days old)."""
 
+import re
 import sys
 import json
 from pathlib import Path
@@ -43,6 +44,13 @@ MISSING = [
 PUBLISHED_AFTER = "2025-01-01T00:00:00Z"
 LABEL_MATURITY_DAYS = 28
 SHORTS_MAX_DURATION_SECONDS = 180
+
+
+def _redact(text):
+    """requests errors embed the full request URL, including ?key=<API key>.
+    Never let that reach stdout or the audit CSV."""
+    return re.sub(r"(key=)[^&\s'\")]+", r"\1REDACTED", str(text))
+
 
 
 def main():
@@ -120,12 +128,12 @@ def main():
             })
 
         except Exception as e:
-            print(f"{handle:<30} -> [error] {e}")
+            print(f"{handle:<30} -> [error] {_redact(e)}")
 
             results.append({
                 "handle": handle,
                 "status": "error",
-                "error": str(e),
+                "error": _redact(e),
             })
 
     # Summary

@@ -22,6 +22,7 @@ Parity details that matter:
 """
 
 import io
+import os
 
 import numpy as np
 import pandas as pd
@@ -54,10 +55,12 @@ class LoadedRatfBundle:
         metrics = meta.get("refit_metrics") or {}
         self.typical_log_error = metrics.get("test_mae_ensemble")  # MAE in log-ratio space, may be None
         # Same shape as the late-fusion bundle dict so app.py's /health and startup log work unchanged.
-        # The packaged file has no train_end date; fall back to the snapshot id.
+        # The packaged file has no train_end date: use MODEL_TRAIN_END (e.g. "2026-05-05 02:00:21+00:00")
+        # if set, else fall back to the snapshot id.
         self.bundle = {
             "version": meta.get("name", "m6_granular_ensemble"),
-            "train_end": meta.get("train_end") or f"snapshot:{meta.get('snapshot_hash')}",
+            "train_end": (meta.get("train_end") or os.environ.get("MODEL_TRAIN_END")
+                          or f"snapshot:{meta.get('snapshot_hash')}"),
             "model_class": meta["model_class"],
             "n_members": self.ens.n_members,
         }
