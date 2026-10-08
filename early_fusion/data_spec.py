@@ -26,6 +26,13 @@ class DataSpec:
     snapshot_hash: Optional[str] = LEGACY_SNAPSHOT_HASH
     split_file: Path = Path("early_fusion/splits/temporal_no_subs.json")
     cache_dir: Path = Path("data_snapshots/token_cache")
+    # "snapshot": legacy cache built for exactly this snapshot (same row order, hash in meta.json)
+    # "store":    TokenStore keyed by video_id (rows are looked up in snapshot order)
+    cache_kind: str = "snapshot"
+
+    def __post_init__(self):
+        if self.cache_kind not in ("snapshot", "store"):
+            raise ValueError(f"cache_kind must be 'snapshot' or 'store', got {self.cache_kind!r}")
 
 
 DEFAULT_SPEC = DataSpec()

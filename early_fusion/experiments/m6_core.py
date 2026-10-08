@@ -177,9 +177,16 @@ def load_data(verbose=True, spec=None):
     genre_to_idx = {g: i + 1 for i, g in enumerate(genres_train)}
     genre_idx = np.array([genre_to_idx.get(g, 0) for g in df["genre"].fillna("")], dtype=np.int64)
 
-    img_tokens, txt_tokens, txt_mask, _thumb_ok, index_df, cache_meta = load_cache(spec.cache_dir)
-    assert (index_df["video_id"].values == df["video_id"].values).all()
-    assert cache_meta["snapshot_hash"] == snap_hash
+    if spec.cache_kind == "store":
+        # TokenStore keyed by video_id: rows are looked up in snapshot order, so no order or
+        # snapshot-hash assertions are needed (take() raises if a video is missing).
+        from early_fusion.datasets.token_store import TokenStore
+        tok = TokenStore(spec.cache_dir).take(df["video_id"].tolist())
+        img_tokens, txt_tokens, txt_mask = tok["img"], tok["txt"], tok["mask"]
+    else:
+        img_tokens, txt_tokens, txt_mask, _thumb_ok, index_df, cache_meta = load_cache(spec.cache_dir)
+        assert (index_df["video_id"].values == df["video_id"].values).all()
+        assert cache_meta["snapshot_hash"] == snap_hash
 
     targets = df["target"].values.astype(np.float32)
 
