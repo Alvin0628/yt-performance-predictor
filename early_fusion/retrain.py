@@ -8,7 +8,10 @@
     package  Kemas N checkpoint jadi SATU bundle .pt (+ .json): tulis train_end, hash snapshot,
              jumlah baris, hash split ke dalam bundle.
     verify   Muat bundle, cek hash/metadata/prediksi/jalur tabular; cetak kontrak JSON.
-    all      export -> tokens -> split -> train -> package -> verify dalam satu perintah.
+    gate     (Fase 5) Nilai kandidat vs bundle live di 10% terbaru dengan bootstrap berpasangan
+             (early_fusion/promotion.py), catat ke promotions.jsonl, cetak keputusan.
+    all      export -> tokens -> split -> train -> package -> verify -> gate dalam satu perintah;
+             --run-id yang sudah ada = dilanjutkan (tahap yang selesai dilewati).
 
 Contoh (PC, dari akar repo, env POSTGRES_* dan MINIO_* sudah di-set):
     python -m early_fusion.retrain all
@@ -23,10 +26,12 @@ Pembangkitan ulang dari snapshot lama (tanpa Postgres), mis. untuk uji reproduks
 KONTRAK STDOUT: baris TERAKHIR stdout selalu satu baris JSON.
   * semua tahap membawa kunci promoted/versioned_path/reason (promoted selalu false di Fase 4);
     tahap selain verify tidak punya new_spearman, dan versioned_path-nya null
-  * verify dan all: kontrak lengkap yang dibaca dags/train_model.py::check_promotion
-        {"promoted": false, "versioned_path": ..., "reason": ..., "new_spearman": ..., ...}
-    Di Fase 4 `promoted` SELALU false: tidak ada kode di sini yang menyentuh bundle live.
-    Gerbang promosi (bootstrap berpasangan vs model live) baru datang di Fase 5.
+  * verify: kontrak lengkap dengan promoted=false (kandidat terverifikasi, belum dinilai)
+  * gate dan all: keputusan promosi sebenarnya, kontrak yang dibaca
+    dags/train_model.py::check_promotion
+        {"promoted": true|false, "versioned_path": ..., "reason": ..., "new_spearman": ..., ...}
+    `gate` hanya MEMUTUSKAN dan MENCATAT; tidak ada kode di sini yang menyalin/menimpa bundle live
+    (promosi = salin ke m6_latest.pt + m6_prev.pt adalah Fase 6).
   Tidak ada yang boleh dicetak setelah baris JSON itu.
 
 Resep produksi = resep bundle live (early_fusion/models/final/m6_granular_ensemble_v1.json):
@@ -53,6 +58,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from early_fusion import promotion as pm
 from early_fusion.data_spec import DataSpec, assign_temporal_split, hash_df, temporal_split_sizes
 
 DEFAULT_ROOT = Path("data_snapshots/retrain")
@@ -80,7 +86,7 @@ SNAPSHOT_QUERY = (
     "ORDER BY published_at, video_id"
 )
 
-STAGES = ("export", "tokens", "split", "train", "package", "verify")
+STAGES = ("export", "tokens", "split", "train", "package", "verify", "gate")
 
 
 # ----------------------------------------------------------------------------------
@@ -282,7 +288,7 @@ def stage_export(run, *, read_sql_fn=None, from_parquet=None, max_rows=None, log
 # Tahap 2: tokens
 # ----------------------------------------------------------------------------------
 def stage_tokens(run, *, store_dir, create_empty=False, batch=16, flush_every=128,
-                 extractor=None, log=print):
+                 extractor=None, max_fail_frac=0.05, log=print):
     from early_fusion.datasets.token_store import TokenStore, META_FILE
     from early_fusion.datasets.token_update import update_store
 
@@ -305,7 +311,8 @@ def stage_tokens(run, *, store_dir, create_empty=False, batch=16, flush_every=12
             from early_fusion.datasets.token_update import make_extractor
             extractor = make_extractor()
             log(f"extractor: {extractor.info}")
-        stats = update_store(store, df, extractor, batch=batch, flush_every=flush_every, log=log)
+        stats = update_store(store, df, extractor, batch=batch, flush_every=flush_every,
+                             max_fail_frac=max_fail_frac, log=log)
     still = store.missing(df["video_id"])
     if still:
         raise RuntimeError(f"{len(still)} video snapshot masih tidak punya token setelah update "
@@ -355,7 +362,30 @@ def _torch_deps():
     def load(path):
         return torch.load(path, map_location="cpu", weights_only=False)
 
-    return SimpleNamespace(load_data=load_data, train_one=train_one, metrics=metrics, save=save, load=load)
+    def score(path, df, idx, store, device):
+        """Prediksi ensemble (rata-rata anggota) di baris `idx`, dengan scaler/genre MILIK bundle itu.
+
+        Token (gambar/teks) bersifat umum (per video_id, dari TokenStore); tabular disiapkan oleh
+        bundle sendiri lewat prepare_tabular, jadi model live dinilai dengan scaler live, bukan scaler
+        kandidat. Kandidat dan live lewat fungsi yang sama -> perbandingan simetris.
+        """
+        from early_fusion.models.m6_ensemble import M6Ensemble
+        ens = M6Ensemble.load(path, device=device)
+        cont, gidx = ens.prepare_tabular(df.iloc[idx])
+        t = torch.as_tensor(np.asarray(idx), dtype=torch.long, device=store["img"].device)
+        mean = ens.predict(store["img"][t], store["txt"][t], store["mask"][t], cont, gidx)
+        return mean, ens.meta
+
+    def shuffle_labels(data, seed):
+        """Acak target HANYA di baris train+val (untuk simulasi kandidat rusak). Test tetap asli."""
+        idx = np.concatenate([data["train_idx"], data["val_idx"]])
+        perm = np.random.default_rng(seed).permutation(len(idx))
+        y = data["store"]["y"]
+        it = torch.as_tensor(idx, dtype=torch.long, device=y.device)
+        y[it] = y[it][torch.as_tensor(perm, dtype=torch.long, device=y.device)]
+
+    return SimpleNamespace(load_data=load_data, train_one=train_one, metrics=metrics, save=save, load=load,
+                           score=score, shuffle_labels=shuffle_labels)
 
 
 # ----------------------------------------------------------------------------------
@@ -366,18 +396,26 @@ def _spearman(a, b):
     return float(spearmanr(a, b)[0])
 
 
-def stage_train(run, *, cfg, seeds, refit_epochs, store_dir, deps=None, log=print):
+def stage_train(run, *, cfg, seeds, refit_epochs, store_dir, shuffle_labels=None, deps=None, log=print):
     """Refit tiap seed di train+val (epoch tetap). Test = 10% terbaru: tidak dilihat kandidat.
 
     Test dievaluasi di sini HANYA untuk dicatat dan dipakai gerbang Fase 5; tidak ada keputusan
     pelatihan (pemilihan epoch, early stop) yang memakainya, karena fit=trainval tanpa val.
     Idempoten per seed: seed yang ckpt+preds-nya sudah ada dilewati (resume setelah crash).
+
+    shuffle_labels=SEED (hanya simulasi gerbang, Fase 5): target train+val diacak sebelum latihan,
+    test tetap asli. Run seperti ini ditandai `sabotage` di run.json dan bundle, dan gate menolak
+    mencatatnya ke promotions.jsonl produksi.
     """
     from early_fusion.experiments.run_m6_config import cfg_hash
 
     run.require("export", "tokens", "split")
     deps = deps or _torch_deps()
     data = deps.load_data(spec=run.spec(store_dir))
+    sabotage = {"shuffle_labels": int(shuffle_labels)} if shuffle_labels is not None else None
+    if sabotage:
+        deps.shuffle_labels(data, int(shuffle_labels))
+        log(f"PERINGATAN: label train+val diacak (seed {shuffle_labels}); ini kandidat SIMULASI.")
     chash = cfg_hash(cfg, "full", "trainval")
     run.ckpt_dir.mkdir(parents=True, exist_ok=True)
     run.preds_dir.mkdir(parents=True, exist_ok=True)
@@ -387,7 +425,8 @@ def stage_train(run, *, cfg, seeds, refit_epochs, store_dir, deps=None, log=prin
         ck, pr = run.ckpt_dir / f"seed{seed}.pt", run.preds_dir / f"seed{seed}.npz"
         if ck.exists() and pr.exists():
             prev = deps.load(ck)
-            if prev.get("cfg_hash") != chash or prev.get("refit_epochs") != refit_epochs:
+            if (prev.get("cfg_hash") != chash or prev.get("refit_epochs") != refit_epochs
+                    or prev.get("sabotage") != sabotage):
                 raise SystemExit(f"checkpoint {ck} dibuat dengan konfigurasi/epoch berbeda "
                                  f"(cfg_hash {prev.get('cfg_hash')} vs {chash}); pakai --run-id baru")
             z = np.load(pr)
@@ -403,9 +442,10 @@ def stage_train(run, *, cfg, seeds, refit_epochs, store_dir, deps=None, log=prin
         deps.save(dict(state_dict=res["state_dict"], cfg=cfg, variant="full", fit="trainval", seed=seed,
                        scaler=data["scaler"], genres_train=data["genres_train"], n_cont=data["n_cont"],
                        n_genres=data["n_genres"], split_hashes=data["split_hashes"], git_sha=data["git_sha"],
-                       cfg_hash=chash, refit_epochs=refit_epochs, run_id=run.run_id), ck)   # ckpt = penanda selesai
+                       cfg_hash=chash, refit_epochs=refit_epochs, run_id=run.run_id,
+                       sabotage=sabotage), ck)   # ckpt = penanda selesai
 
-    info = dict(seeds=list(seeds), refit_epochs=refit_epochs, cfg=cfg, cfg_hash=chash,
+    info = dict(seeds=list(seeds), refit_epochs=refit_epochs, cfg=cfg, cfg_hash=chash, sabotage=sabotage,
                 test_spearman_per_seed={str(k): v for k, v in per_seed.items()}, seconds=round(seconds, 1))
     run.mark("train", info)
     return info
@@ -461,6 +501,8 @@ def stage_package(run, *, deps=None, log=print):
         # tambahan retrain otomatis (M6Ensemble.load menaruhnya di .meta; LoadedRatfBundle membaca train_end)
         train_end=exp["train_end"], n_rows=n_rows, refit_epochs=trn["refit_epochs"], run_id=run.run_id,
     )
+    if trn.get("sabotage"):
+        blob_out["sabotage"] = trn["sabotage"]
     deps.save(blob_out, out)
 
     digest = sha256_file(out)
@@ -569,6 +611,109 @@ def stage_verify(run, *, store_dir, log=print):
     return decision
 
 
+# ----------------------------------------------------------------------------------
+# Tahap 7: gate (Fase 5)
+# ----------------------------------------------------------------------------------
+def run_deviations(run):
+    """Penyimpangan run ini dari resep produksi (kosong = run standar)."""
+    exp, trn = run.stage_info("export"), run.stage_info("train")
+    dev = {}
+    if trn["refit_epochs"] != PRODUCTION_REFIT_EPOCHS:
+        dev["refit_epochs"] = trn["refit_epochs"]
+    if list(trn["seeds"]) != PRODUCTION_SEEDS:
+        dev["seeds"] = list(trn["seeds"])
+    if trn.get("cfg") != load_production_cfg():
+        dev["cfg"] = "berbeda dari resep produksi"
+    if trn.get("sabotage"):
+        dev["sabotage"] = trn["sabotage"]
+    if exp.get("max_rows"):
+        dev["max_rows"] = exp["max_rows"]
+    return dev
+
+
+def check_gate_args(live_path, first_promotion):
+    """Tepat satu dari --live PATH atau --first-promotion; path live yang tidak ada = error.
+
+    Sengaja eksplisit: path live yang salah ketik TIDAK boleh diam-diam menjadi "promosi pertama".
+    """
+    if bool(live_path) == bool(first_promotion):
+        raise SystemExit("gate: pilih tepat satu: --live PATH_BUNDLE_LIVE atau --first-promotion "
+                         "(tidak ada bundle live sama sekali)")
+    if live_path and not Path(live_path).exists():
+        raise SystemExit(f"gate: bundle live tidak ditemukan: {live_path}")
+
+
+def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_train_end=None,
+               log_path=pm.PROMOTION_LOG_PATH, deps=None, log=print):
+    """Nilai kandidat dan bundle live di 10% terbaru snapshot ini; putuskan; catat. Tidak menyalin apa pun.
+
+    Test (10% terbaru) tidak pernah dilihat kandidat (fit=trainval) maupun model live (check_no_leak).
+    Keduanya dinilai lewat fungsi yang sama, masing-masing dengan scaler/genre miliknya.
+    """
+    from features.target import compute_target
+    from early_fusion.splits.load_split import apply_split_to_df, load_canonical_split
+
+    run.require("export", "split", "train", "package", "verify")
+    check_gate_args(live_path, first_promotion)
+    dev = run_deviations(run)
+    if dev and Path(log_path).resolve() == Path(pm.PROMOTION_LOG_PATH).resolve():
+        raise SystemExit(f"gate: run ini menyimpang dari resep produksi {dev}; jangan dicatat ke "
+                         f"{pm.PROMOTION_LOG_PATH}. Pakai --log-path lain (mis. data_snapshots/promotions_sim.jsonl).")
+
+    deps = deps or _torch_deps()
+    spec = run.spec(store_dir)
+    data = deps.load_data(spec=spec)
+    df = pd.read_parquet(run.snapshot_path)
+    df = df.drop(columns=[c for c in EMBEDDING_COLS if c in df.columns]).reset_index(drop=True)
+    df["target"] = compute_target(df["views"], df["trailing_avg_views"])
+    tr, va, te = apply_split_to_df(df, load_canonical_split(verbose=False, spec=spec))
+    targets = df["target"].values[te]
+    test_start = str(df["published_at"].iloc[te].min())
+
+    pkg = run.stage_info("package")
+    cand_path = Path(pkg["bundle"])
+    new_preds, cand_meta = deps.score(cand_path, df, te, data["store"], data["device"])
+
+    old_preds, live_sha = None, None
+    if live_path:
+        old_preds, live_meta = deps.score(live_path, df, te, data["store"], data["device"])
+        live_sha = pm.sha256_file(live_path)
+        live_end = live_meta.get("train_end") or live_train_end
+        if live_end is None:
+            raise SystemExit("gate: bundle live tidak punya train_end (bundle lama). Berikan --live-train-end "
+                             "'<waktu publikasi terbaru di train+val bundle live>' supaya bisa dipastikan "
+                             "live tidak pernah melihat baris test.")
+        try:
+            pm.check_no_leak(live_end, test_start)
+        except ValueError as e:
+            raise SystemExit(f"gate: {e}")
+        live_train_end = str(live_end)
+
+    baseline = pm.linear_baseline_spearman(df.iloc[np.concatenate([tr, va])], df.iloc[te])
+    extra = dict(
+        model_kind="m6_ensemble", run_id=run.run_id, snapshot_hash=run.stage_info("export")["snapshot_hash"],
+        n_test=int(len(te)), test_start=test_start, candidate_train_end=cand_meta.get("train_end"),
+        candidate_sha256=pkg["sha256"], n_members=len(run.stage_info("train")["seeds"]),
+        live_path=str(live_path) if live_path else None, live_sha256=live_sha, live_train_end=live_train_end,
+        baseline_fit="train+val", bootstrap_seed=pm.BOOTSTRAP_SEED,
+    )
+    if dev:
+        extra["deviations"] = dev
+    decision = pm.decide(new_preds=new_preds, targets=targets, baseline_spearman=baseline,
+                         old_preds=old_preds, first_promotion=first_promotion,
+                         versioned_path=cand_path, extra=extra)
+    pm.log_decision(decision, log_path)
+    verdict = "PROMOTED" if decision["promoted"] else "REJECTED"
+    ci = (f" CI=[{decision['ci_lower']:.4f}, {decision['ci_upper']:.4f}] margin={decision['ci_reject_margin']}"
+          if "ci_lower" in decision else "")
+    log(f"[gate] {verdict} -- {decision['reason']} | new={decision['new_spearman']:.4f} "
+        f"old={decision.get('old_spearman', float('nan')):.4f} baseline={baseline:.4f}{ci}")
+    log(f"[gate] dicatat di {log_path}")
+    result = {**decision, "stage": "gate", "run_id": run.run_id}
+    run.mark("gate", result)
+    return result
+
+
 def stage_payload(stage, run, info):
     """JSON baris terakhir untuk tahap selain verify.
 
@@ -599,22 +744,37 @@ def _args_tokens(p):
     p.add_argument("--create-empty", action="store_true")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--flush-every", type=int, default=128)
+    p.add_argument("--max-fail-frac", type=float, default=0.05,
+                   help="hentikan (tanpa menulis ke store) bila lebih dari ini thumbnail gagal dimuat dalam satu kelompok")
 
 
 def _args_train(p):
     p.add_argument("--config", default=str(FINAL_CFG))
     p.add_argument("--seeds", type=int, nargs="+", default=PRODUCTION_SEEDS)
     p.add_argument("--refit-epochs", type=int, default=PRODUCTION_REFIT_EPOCHS)
+    p.add_argument("--threads", type=int, default=None,
+                   help="jumlah thread CPU torch (di VM sisakan core untuk API)")
     p.add_argument("--set", nargs="*", default=[], metavar="K=V",
                    help="override cfg (hanya uji coba kering; dicatat di run.json dan bundle)")
+    p.add_argument("--shuffle-labels", type=int, default=None, metavar="SEED",
+                   help="SIMULASI gerbang: acak target train+val (kandidat rusak); run ditandai sabotage")
+
+
+def _args_gate(p):
+    p.add_argument("--live", default=None, help="path bundle live yang dibandingkan (wajib, atau --first-promotion)")
+    p.add_argument("--first-promotion", action="store_true", help="tidak ada bundle live sama sekali")
+    p.add_argument("--live-train-end", default=None,
+                   help="train_end bundle live bila bundle itu tidak menyimpannya (bundle lama)")
+    p.add_argument("--log-path", default=pm.PROMOTION_LOG_PATH,
+                   help="berkas JSONL keputusan (run non-standar/simulasi tidak boleh ke berkas produksi)")
 
 
 def build_parser():
     ap = argparse.ArgumentParser(prog="python -m early_fusion.retrain", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="stage", required=True)
     for name, extra in (("export", [_args_export]), ("tokens", [_args_tokens]), ("split", []),
-                        ("train", [_args_train]), ("package", []), ("verify", []),
-                        ("all", [_args_export, _args_tokens, _args_train])):
+                        ("train", [_args_train]), ("package", []), ("verify", []), ("gate", [_args_gate]),
+                        ("all", [_args_export, _args_tokens, _args_train, _args_gate])):
         p = sub.add_parser(name)
         _common(p)
         for fn in extra:
@@ -630,36 +790,69 @@ def _get_run(args, create):
     return Run.existing(args.root, args.run_id)
 
 
+def _get_run_all(args):
+    """`all` membuat run baru, kecuali --run-id menunjuk run yang sudah ada: itu dilanjutkan."""
+    if args.run_id and Run(args.root, args.run_id).state_path.exists():
+        return Run.existing(args.root, args.run_id), True
+    return Run.new(args.root, args.run_id), False
+
+
+def _apply_threads(args):
+    if getattr(args, "threads", None):
+        import torch
+        torch.set_num_threads(int(args.threads))
+
+
 def _train_kwargs(args):
     return dict(cfg=load_production_cfg(args.config, parse_overrides(args.set)), seeds=args.seeds,
-                refit_epochs=args.refit_epochs, store_dir=args.store)
+                refit_epochs=args.refit_epochs, store_dir=args.store, shuffle_labels=args.shuffle_labels)
+
+
+def _gate_kwargs(args):
+    return dict(store_dir=args.store, live_path=args.live, first_promotion=args.first_promotion,
+                live_train_end=args.live_train_end, log_path=args.log_path)
 
 
 def run_stage(args):
     st = args.stage
     if st == "all":
-        run = _get_run(args, create=True)
-        print(f"run {run.run_id}", flush=True)
-        stage_export(run, from_parquet=args.from_parquet, max_rows=args.max_rows)
-        stage_tokens(run, store_dir=args.store, create_empty=args.create_empty,
-                     batch=args.batch, flush_every=args.flush_every)
-        stage_split(run)
-        stage_train(run, **_train_kwargs(args))
-        stage_package(run)
-        return stage_verify(run, store_dir=args.store)
+        check_gate_args(args.live, args.first_promotion)          # gagal cepat, sebelum run dibuat / training
+        run, resumed = _get_run_all(args)
+        print(f"run {run.run_id}" + (" (dilanjutkan)" if resumed else ""), flush=True)
+        done = run.load_state()["stages"]
+        if "gate" in done:                                # run sudah tuntas: tampilkan keputusan yang tersimpan
+            return {k: v for k, v in done["gate"].items() if k != "finished_at"}
+        _apply_threads(args)
+        if "export" not in done:
+            stage_export(run, from_parquet=args.from_parquet, max_rows=args.max_rows)
+        if "tokens" not in done:
+            stage_tokens(run, store_dir=args.store, create_empty=args.create_empty, batch=args.batch,
+                         flush_every=args.flush_every, max_fail_frac=args.max_fail_frac)
+        if "split" not in done:
+            stage_split(run)
+        if "train" not in done:
+            stage_train(run, **_train_kwargs(args))
+        if "package" not in done:
+            stage_package(run)
+        if "verify" not in done:
+            stage_verify(run, store_dir=args.store)
+        return stage_gate(run, **_gate_kwargs(args))
 
     run = _get_run(args, create=(st == "export"))
     if st == "export":
         info = stage_export(run, from_parquet=args.from_parquet, max_rows=args.max_rows)
     elif st == "tokens":
         info = stage_tokens(run, store_dir=args.store, create_empty=args.create_empty,
-                            batch=args.batch, flush_every=args.flush_every)
+                            batch=args.batch, flush_every=args.flush_every, max_fail_frac=args.max_fail_frac)
     elif st == "split":
         info = stage_split(run)
     elif st == "train":
+        _apply_threads(args)
         info = stage_train(run, **_train_kwargs(args))
     elif st == "package":
         info = stage_package(run)
+    elif st == "gate":
+        return stage_gate(run, **_gate_kwargs(args))
     else:
         return stage_verify(run, store_dir=args.store)
     return stage_payload(st, run, info)
