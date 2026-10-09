@@ -38,12 +38,18 @@ def numerics(mode="legacy"):
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prev
 
 
-def update_store(store, df, extract_fn, batch=16, flush_every=128, limit=None, log=print):
+def update_store(store, df, extract_fn, batch=16, flush_every=128, limit=None, log=print,
+                 max_fail_frac=None, fail_abort_min=5):
     """Extract and append tokens for every video_id in df that the store does not have.
 
     df: needs 'video_id' and 'title', in snapshot order.
     extract_fn(video_ids, titles) -> (img (B,50,768), txt (B,L,512), mask (B,L), ok (B,))
     Rows are appended every `flush_every` videos, so an interrupted run resumes where it stopped.
+
+    max_fail_frac: if set, a group of pending videos in which at least `fail_abort_min` thumbnails failed
+    AND more than this fraction failed is NOT appended and a RuntimeError is raised. A failed thumbnail
+    is stored as zero tokens for good (it is never retried), so a MinIO outage must stop the run
+    instead of being written into the store.
     """
     titles = dict(zip(df["video_id"], df["title"]))
     todo = store.missing(df["video_id"])
@@ -58,6 +64,11 @@ def update_store(store, df, extract_fn, batch=16, flush_every=128, limit=None, l
     def flush():
         if not pend_ids:
             return
+        n_fail = int((~np.concatenate(pend["ok"])).sum())
+        if max_fail_frac is not None and n_fail >= fail_abort_min and n_fail / len(pend_ids) > max_fail_frac:
+            raise RuntimeError(
+                f"{n_fail} of {len(pend_ids)} thumbnails failed to load (more than {max_fail_frac:.0%}); "
+                f"not writing them to the token store. Check MinIO, then rerun (finished rows are kept).")
         store.append(pend_ids, np.concatenate(pend["img"]), np.concatenate(pend["txt"]),
                      np.concatenate(pend["mask"]), np.concatenate(pend["ok"]))
         stats["n_new"] += len(pend_ids)
