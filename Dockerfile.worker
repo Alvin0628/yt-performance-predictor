@@ -14,6 +14,14 @@ COPY ingestion/ ingestion/
 COPY pipeline/ pipeline/
 COPY models/ models/
 COPY features/ features/
+# Early-fusion retraining (python -m early_fusion.retrain). Selective COPY: model code, token extractor,
+# gate and recipe files only -- not the 60 MB bundle, results/, or anything under data_snapshots/.
+COPY early_fusion/__init__.py early_fusion/data_spec.py early_fusion/live_bundle.py early_fusion/promotion.py early_fusion/retrain.py early_fusion/
+COPY early_fusion/datasets/ early_fusion/datasets/
+COPY early_fusion/models/*.py early_fusion/models/
+COPY early_fusion/experiments/ early_fusion/experiments/
+COPY early_fusion/splits/ early_fusion/splits/
+COPY early_fusion/results/final_cfg.json early_fusion/results/
 
 RUN python -c "from transformers import CLIPModel, AutoTokenizer; \
 CLIPModel.from_pretrained('openai/clip-vit-base-patch32'); \

@@ -16,8 +16,18 @@ membandingkannya dengan sumber models/train.py supaya tidak menyimpang diam-diam
 Modul ini sengaja TIDAK meng-import torch: murni numpy/scipy/sklearn. Penilaian bundle (yang butuh
 torch) ada di early_fusion/retrain.py::stage_gate dan disuntikkan ke sini sebagai array prediksi.
 
+Gerbang ke-3 (Fase 6, opsional): ANCHOR. Kandidat yang lolos gerbang lunak melawan model live juga
+dibandingkan, di baris test yang sama, dengan model referensi tetap (bundle v1). Ditolak bila batas ATAS
+CI 95% (kandidat - anchor) < ANCHOR_MARGIN (bawaan 0.0: yakin lebih buruk dari anchor sama sekali).
+Alasannya: gerbang lunak membandingkan dengan live saja dan membiarkan selisih sampai -0.01, sehingga
+promosi yang masing-masing sedikit lebih buruk bisa menurunkan kualitas pelan-pelan tanpa pernah ditolak.
+Anchor tidak ikut berubah, jadi ia membatasi penurunan KUMULATIF. Perbandingan berpasangan di baris yang
+sama dipakai (bukan Spearman absolut dibanding riwayat), karena test slice berganti tiap retraining dan
+Spearman absolut antar-slice tidak sebanding. Batasnya: anchor menangkap regresi (mis. pipeline fitur
+rusak), bukan concept drift yang menurunkan semua model sekaligus.
+
 Modul ini hanya MEMUTUSKAN dan MENCATAT. Menyalin bundle ke m6_latest.pt (dan m6_prev.pt untuk
-rollback) adalah Fase 6.
+rollback) dilakukan early_fusion/live_bundle.py, dipanggil oleh retrain.py::stage_gate bila --promote.
 """
 import hashlib
 import json
@@ -33,6 +43,7 @@ from scipy.stats import spearmanr
 CI_REJECT_MARGIN = float(os.environ.get("PROMOTION_CI_REJECT_MARGIN", "-0.01"))
 N_BOOTSTRAP = int(os.environ.get("PROMOTION_N_BOOTSTRAP", "2000"))
 BOOTSTRAP_SEED = int(os.environ.get("PROMOTION_BOOTSTRAP_SEED", "42"))   # train.py memakai env SEED (42)
+ANCHOR_MARGIN = float(os.environ.get("PROMOTION_ANCHOR_MARGIN", "0.0"))
 PROMOTION_LOG_PATH = "experiments/promotions.jsonl"
 
 # String alasan identik dengan models/train.py (log lama dan baru bisa dibaca seragam).
@@ -40,6 +51,7 @@ REASON_HARD_GATE = "failed hard gate: did not beat linear (trailing_avg_views) b
 REASON_FIRST = "no currently-served bundle to compare against (first promotion)"
 REASON_REJECT = "CI confidently below reject margin -- new model is worse than live model"
 REASON_PROMOTE = "beat hard gate; not confidently worse than live model (ties go to newer)"
+REASON_ANCHOR = "CI confidently below the fixed anchor model -- candidate regressed against the reference"
 
 
 def paired_bootstrap_ci(new_preds, old_preds, targets, n_bootstrap, seed, ci=0.95):
@@ -76,16 +88,22 @@ def linear_baseline_spearman(train_df, test_df):
 
 
 def decide(*, new_preds, targets, baseline_spearman, old_preds=None, first_promotion=False,
-           versioned_path=None, margin=None, n_bootstrap=None, seed=None, extra=None):
+           versioned_path=None, margin=None, n_bootstrap=None, seed=None, extra=None,
+           anchor_preds=None, anchor_margin=None):
     """Putusan promosi. Mengembalikan dict (kunci inti sama dengan promotions.jsonl lama).
 
     old_preds=None hanya sah bila first_promotion=True (tidak ada bundle live). Tanpa itu: ValueError,
     supaya path live yang salah ketik tidak diam-diam menjadi "promosi pertama".
     """
     margin = CI_REJECT_MARGIN if margin is None else margin
+    anchor_margin = ANCHOR_MARGIN if anchor_margin is None else anchor_margin
     n_bootstrap = N_BOOTSTRAP if n_bootstrap is None else n_bootstrap
     seed = BOOTSTRAP_SEED if seed is None else seed
     new_preds, targets = np.asarray(new_preds), np.asarray(targets)
+    if anchor_preds is not None:
+        anchor_preds = np.asarray(anchor_preds)
+        if len(anchor_preds) != len(targets):
+            raise ValueError("panjang anchor_preds harus sama dengan targets (baris test yang sama)")
     if old_preds is None and not first_promotion:
         raise ValueError("old_preds wajib diisi kecuali first_promotion=True")
     if old_preds is not None:
@@ -114,6 +132,12 @@ def decide(*, new_preds, targets, baseline_spearman, old_preds=None, first_promo
             decision.update(promoted=False, reason=REASON_REJECT)
         else:
             decision.update(promoted=True, reason=REASON_PROMOTE)
+            if anchor_preds is not None:                       # gerbang ke-3: hanya untuk yang lolos gerbang lunak
+                a_lower, a_upper = paired_bootstrap_ci(new_preds, anchor_preds, targets, n_bootstrap, seed)
+                decision.update(anchor_spearman=float(spearmanr(anchor_preds, targets)[0]),
+                                anchor_ci_lower=a_lower, anchor_ci_upper=a_upper, anchor_margin=anchor_margin)
+                if a_upper < anchor_margin:
+                    decision.update(promoted=False, reason=REASON_ANCHOR)
     decision.update(extra or {})
     return decision
 

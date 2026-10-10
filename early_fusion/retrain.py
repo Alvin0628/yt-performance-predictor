@@ -30,8 +30,13 @@ KONTRAK STDOUT: baris TERAKHIR stdout selalu satu baris JSON.
   * gate dan all: keputusan promosi sebenarnya, kontrak yang dibaca
     dags/train_model.py::check_promotion
         {"promoted": true|false, "versioned_path": ..., "reason": ..., "new_spearman": ..., ...}
-    `gate` hanya MEMUTUSKAN dan MENCATAT; tidak ada kode di sini yang menyalin/menimpa bundle live
-    (promosi = salin ke m6_latest.pt + m6_prev.pt adalah Fase 6).
+    `gate` MEMUTUSKAN dan MENCATAT. Bundle live baru diganti HANYA bila --promote diberikan, keputusannya
+    PROMOTE, dan run standar (early_fusion/live_bundle.py: latest disalin ke prev, lalu latest diganti
+    atomik). Kunci `applied` pada JSON = bundle benar-benar sudah diganti. `promoted` true dengan
+    `applied` false berarti "akan dipromosikan" (tanpa --promote); DAG me-restart API hanya bila applied.
+    --anchor PATH menambah gerbang ke-3 (bandingkan dengan model referensi tetap), --min-new-rows N
+    (hanya `all`, butuh snapshot_n_total di m6_latest.json) melewati retraining bila data baru sedikit:
+    JSON-nya skipped=true, promoted=false.
   Tidak ada yang boleh dicetak setelah baris JSON itu.
 
 Resep produksi = resep bundle live (early_fusion/models/final/m6_granular_ensemble_v1.json):
@@ -58,6 +63,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from early_fusion import live_bundle as lb
 from early_fusion import promotion as pm
 from early_fusion.data_spec import DataSpec, assign_temporal_split, hash_df, temporal_split_sizes
 
@@ -644,21 +650,31 @@ def check_gate_args(live_path, first_promotion):
 
 
 def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_train_end=None,
-               log_path=pm.PROMOTION_LOG_PATH, deps=None, log=print):
-    """Nilai kandidat dan bundle live di 10% terbaru snapshot ini; putuskan; catat. Tidak menyalin apa pun.
+               log_path=pm.PROMOTION_LOG_PATH, anchor_path=None, promote=False,
+               bundles_dir=lb.DEFAULT_BUNDLES, deps=None, log=print):
+    """Nilai kandidat dan bundle live di 10% terbaru snapshot ini; putuskan; catat; (opsional) promosikan.
 
     Test (10% terbaru) tidak pernah dilihat kandidat (fit=trainval) maupun model live (check_no_leak).
     Keduanya dinilai lewat fungsi yang sama, masing-masing dengan scaler/genre miliknya.
+
+    anchor_path: model referensi tetap; hanya dipakai bila ada bundle live (bukan --first-promotion).
+    promote: bila True dan keputusan PROMOTE, salin kandidat ke bundles_dir/m6_latest.* (live lama ke m6_prev.*).
+    Hanya run standar yang boleh dipromosikan. Kegagalan menyalin dicatat (applied=false, apply_error) lalu
+    task digagalkan: keputusan dan keadaan berkas tidak boleh saling berbohong.
     """
     from features.target import compute_target
     from early_fusion.splits.load_split import apply_split_to_df, load_canonical_split
 
     run.require("export", "split", "train", "package", "verify")
     check_gate_args(live_path, first_promotion)
+    if anchor_path and not Path(anchor_path).exists():
+        raise SystemExit(f"gate: bundle anchor tidak ditemukan: {anchor_path}")
     dev = run_deviations(run)
     if dev and Path(log_path).resolve() == Path(pm.PROMOTION_LOG_PATH).resolve():
         raise SystemExit(f"gate: run ini menyimpang dari resep produksi {dev}; jangan dicatat ke "
                          f"{pm.PROMOTION_LOG_PATH}. Pakai --log-path lain (mis. data_snapshots/promotions_sim.jsonl).")
+    if dev and promote:
+        raise SystemExit(f"gate: --promote hanya untuk run standar; run ini menyimpang dari resep produksi {dev}")
 
     deps = deps or _torch_deps()
     spec = run.spec(store_dir)
@@ -675,19 +691,42 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
     new_preds, cand_meta = deps.score(cand_path, df, te, data["store"], data["device"])
 
     old_preds, live_sha = None, None
+    anchor_preds, anchor_sha, anchor_end = None, None, None
     if live_path:
+        try:
+            live_side = lb.verify_sidecar(live_path)
+        except ValueError as e:
+            raise SystemExit(f"gate: {e}")
         old_preds, live_meta = deps.score(live_path, df, te, data["store"], data["device"])
         live_sha = pm.sha256_file(live_path)
-        live_end = live_meta.get("train_end") or live_train_end
+        live_end = live_meta.get("train_end") or (live_side or {}).get("train_end") or live_train_end
         if live_end is None:
             raise SystemExit("gate: bundle live tidak punya train_end (bundle lama). Berikan --live-train-end "
-                             "'<waktu publikasi terbaru di train+val bundle live>' supaya bisa dipastikan "
+                             "'<waktu publikasi terbaru di train+val bundle live>' (atau m6_latest.json dari "
+                             "`python -m early_fusion.live_bundle bootstrap`) supaya bisa dipastikan "
                              "live tidak pernah melihat baris test.")
         try:
             pm.check_no_leak(live_end, test_start)
         except ValueError as e:
             raise SystemExit(f"gate: {e}")
         live_train_end = str(live_end)
+
+        if anchor_path:
+            try:
+                anchor_side = lb.verify_sidecar(anchor_path)
+            except ValueError as e:
+                raise SystemExit(f"gate (anchor): {e}")
+            anchor_preds, anchor_meta = deps.score(anchor_path, df, te, data["store"], data["device"])
+            anchor_sha = pm.sha256_file(anchor_path)
+            anchor_end = anchor_meta.get("train_end") or (anchor_side or {}).get("train_end")
+            if anchor_end is None:
+                raise SystemExit("gate (anchor): bundle anchor tidak punya train_end; buat m6_anchor.json lewat "
+                                 "`python -m early_fusion.live_bundle bootstrap`")
+            try:
+                pm.check_no_leak(anchor_end, test_start)
+            except ValueError as e:
+                raise SystemExit(f"gate (anchor): {e}")
+            anchor_end = str(anchor_end)
 
     baseline = pm.linear_baseline_spearman(df.iloc[np.concatenate([tr, va])], df.iloc[te])
     extra = dict(
@@ -697,18 +736,38 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
         live_path=str(live_path) if live_path else None, live_sha256=live_sha, live_train_end=live_train_end,
         baseline_fit="train+val", bootstrap_seed=pm.BOOTSTRAP_SEED,
     )
+    if anchor_preds is not None:
+        extra.update(anchor_path=str(anchor_path), anchor_sha256=anchor_sha, anchor_train_end=anchor_end)
     if dev:
         extra["deviations"] = dev
     decision = pm.decide(new_preds=new_preds, targets=targets, baseline_spearman=baseline,
                          old_preds=old_preds, first_promotion=first_promotion,
-                         versioned_path=cand_path, extra=extra)
+                         versioned_path=cand_path, extra=extra, anchor_preds=anchor_preds)
+
+    decision.update(promote_requested=bool(promote), applied=False)
+    apply_error = None
+    if promote and decision["promoted"]:
+        try:
+            applied = lb.promote(cand_path, bundles_dir)
+            decision.update(applied=True, applied_latest=applied["latest"], applied_prev=applied["prev"])
+        except Exception as e:                       # dicatat apa adanya, lalu task digagalkan di bawah
+            decision.update(applied=False, apply_error=repr(e))
+            apply_error = e
     pm.log_decision(decision, log_path)
+
     verdict = "PROMOTED" if decision["promoted"] else "REJECTED"
+    if decision["promoted"]:
+        verdict += " (APPLIED)" if decision["applied"] else " (tidak diterapkan: tanpa --promote)" if not promote else " (GAGAL diterapkan)"
     ci = (f" CI=[{decision['ci_lower']:.4f}, {decision['ci_upper']:.4f}] margin={decision['ci_reject_margin']}"
           if "ci_lower" in decision else "")
+    anc = (f" anchor={decision['anchor_spearman']:.4f} CI=[{decision['anchor_ci_lower']:.4f}, "
+           f"{decision['anchor_ci_upper']:.4f}] margin={decision['anchor_margin']}" if "anchor_ci_lower" in decision else "")
     log(f"[gate] {verdict} -- {decision['reason']} | new={decision['new_spearman']:.4f} "
-        f"old={decision.get('old_spearman', float('nan')):.4f} baseline={baseline:.4f}{ci}")
+        f"old={decision.get('old_spearman', float('nan')):.4f} baseline={baseline:.4f}{ci}{anc}")
     log(f"[gate] dicatat di {log_path}")
+    if apply_error is not None:
+        raise RuntimeError(f"gate: keputusan PROMOTE, tetapi bundle gagal diganti: {apply_error!r} "
+                           f"(m6_latest tetap bundle lama; keputusan dicatat dengan applied=false)") from apply_error
     result = {**decision, "stage": "gate", "run_id": run.run_id}
     run.mark("gate", result)
     return result
@@ -721,7 +780,7 @@ def stage_payload(stage, run, info):
     kalau dijalankan sendirian sebagai task DAG, tetap menghasilkan XCom yang valid. `new_spearman`
     sengaja tidak ada (belum ada nilainya); check_promotion memakai nan sebagai bawaan.
     """
-    return {"promoted": False, "versioned_path": None,
+    return {"promoted": False, "applied": False, "versioned_path": None,
             "reason": f"tahap '{stage}' selesai; belum ada kandidat yang dinilai",
             "stage": stage, "status": "ok", "run_id": run.run_id, **info}
 
@@ -767,6 +826,17 @@ def _args_gate(p):
                    help="train_end bundle live bila bundle itu tidak menyimpannya (bundle lama)")
     p.add_argument("--log-path", default=pm.PROMOTION_LOG_PATH,
                    help="berkas JSONL keputusan (run non-standar/simulasi tidak boleh ke berkas produksi)")
+    p.add_argument("--anchor", default=None,
+                   help="bundle referensi tetap (m6_anchor.pt): gerbang ke-3, kandidat tidak boleh yakin lebih buruk")
+    p.add_argument("--promote", action="store_true",
+                   help="bila keputusan PROMOTE (run standar), ganti bundles-dir/m6_latest.* dan simpan yang lama di m6_prev.*")
+    p.add_argument("--bundles-dir", default=str(lb.DEFAULT_BUNDLES), help="tempat m6_latest/m6_prev (untuk --promote)")
+
+
+def _args_all(p):
+    p.add_argument("--min-new-rows", type=int, default=0,
+                   help="lewati retraining bila video baru sejak bundle live (snapshot_n_total di m6_latest.json) "
+                        "kurang dari ini; 0 = selalu jalan")
 
 
 def build_parser():
@@ -774,7 +844,7 @@ def build_parser():
     sub = ap.add_subparsers(dest="stage", required=True)
     for name, extra in (("export", [_args_export]), ("tokens", [_args_tokens]), ("split", []),
                         ("train", [_args_train]), ("package", []), ("verify", []), ("gate", [_args_gate]),
-                        ("all", [_args_export, _args_tokens, _args_train, _args_gate])):
+                        ("all", [_args_export, _args_tokens, _args_train, _args_gate, _args_all])):
         p = sub.add_parser(name)
         _common(p)
         for fn in extra:
@@ -810,7 +880,29 @@ def _train_kwargs(args):
 
 def _gate_kwargs(args):
     return dict(store_dir=args.store, live_path=args.live, first_promotion=args.first_promotion,
-                live_train_end=args.live_train_end, log_path=args.log_path)
+                live_train_end=args.live_train_end, log_path=args.log_path, anchor_path=args.anchor,
+                promote=args.promote, bundles_dir=args.bundles_dir)
+
+
+def _maybe_skip(run, args, log=print):
+    """Lewati retraining bila data baru terlalu sedikit. None = lanjut; dict = hasil 'skipped' (sudah ditandai)."""
+    n_min = getattr(args, "min_new_rows", 0) or 0
+    if not n_min or not args.live:
+        return None
+    live_n = lb.snapshot_n_total(lb.read_sidecar(args.live))
+    n_total = run.stage_info("export")["n_total"]
+    if live_n is None:
+        log("[skip-check] bundle live tidak mencatat snapshot_n_total: pemeriksaan data baru dilewati")
+        return None
+    n_new = int(n_total) - int(live_n)
+    if n_new >= n_min:
+        log(f"[skip-check] {n_new} video baru sejak bundle live (minimum {n_min}): retraining dilanjutkan")
+        return None
+    result = {"promoted": False, "applied": False, "skipped": True, "versioned_path": None, "new_spearman": None,
+              "stage": "skip", "run_id": run.run_id, "n_total": int(n_total), "live_n": int(live_n), "n_new": n_new,
+              "reason": f"hanya {n_new} video baru sejak bundle live (minimum {n_min}); retraining dilewati"}
+    run.mark("gate", result)
+    return result
 
 
 def run_stage(args):
@@ -825,6 +917,9 @@ def run_stage(args):
         _apply_threads(args)
         if "export" not in done:
             stage_export(run, from_parquet=args.from_parquet, max_rows=args.max_rows)
+        skipped = _maybe_skip(run, args)
+        if skipped:
+            return skipped
         if "tokens" not in done:
             stage_tokens(run, store_dir=args.store, create_empty=args.create_empty, batch=args.batch,
                          flush_every=args.flush_every, max_fail_frac=args.max_fail_frac)

@@ -1,54 +1,37 @@
-"""train_model -- retrain the late-fusion model on all currently embedded rows.
+"""train_model -- retrain the early-fusion (RATF M6) ensemble and swap it in if the promotion gate agrees.
 
-Runs models/train.py inside a ytpp-worker container.
+Runs `python -m early_fusion.retrain all` inside a ytpp-worker container: export a fresh snapshot from
+Postgres -> update the token store (only new videos) -> split -> refit 5 seeds on train+val -> package ->
+verify -> gate (candidate vs the live bundle, plus the fixed anchor) -> if promoted, replace
+models/bundles/m6_latest.* (the previous live bundle is kept as m6_prev.*). The container prints a JSON
+decision as its last line; check_promotion below reads it and restarts the `api` container only when the
+bundle was actually replaced (`applied`). Decisions are appended to experiments/promotions.jsonl.
 
-schedule=None: not on its own clock. Triggered automatically by embed_new's
-trigger_train_model task (with trigger_rule="all_done", so it fires whether
-embedding succeeded or failed -- see embed_new.py's docstring for why that's
-safe). Still runnable by hand (`airflow dags trigger train_model`) any time.
+schedule=None: not on its own clock. Triggered by embed_new's trigger_train_model task (trigger_rule
+"all_done"). Still runnable by hand (`airflow dags trigger train_model`). KEEP IT PAUSED until the
+Phase 8 checklist (benchmark on the VM, bootstrap of m6_latest/m6_anchor, token store in place) is done.
 
-Unlike ingest_new/embed_new, this task's outputs must survive the container's
-removal: auto_remove="success" wipes anything written only inside the
-container's own filesystem, and train.py writes its checkpoint, model bundle,
-results log and plots to local paths (models/checkpoints, models/bundles,
-experiments/results.jsonl, models/plots). So this DAG bind-mounts those paths
-back to the host. Writing into the same host directory the `api` service
-already mounts read-only (./models/bundles) means a freshly trained bundle is
-picked up without restarting the API -- just re-point MODEL_BUNDLE_PATH or
-restart `api` to load it, depending on how serving/bundle.py picks the file.
+What must exist on the host before the first run (HOST_PROJECT_DIR is the repo as the *Docker daemon* sees it):
+  models/bundles/m6_latest.pt + .json and m6_anchor.pt + .json
+      python -m early_fusion.live_bundle bootstrap --src <current live bundle> --train-end ... --snapshot-n-total ...
+  data_snapshots/token_store/   (copy of the token cache, or `retrain tokens --create-empty` to extract everything)
+  data_snapshots/retrain/       (runs are written here; prune old ones by hand for now)
+  experiments/                  (promotions.jsonl is appended here)
 
-Requires HOST_PROJECT_DIR in .env: the path to this repo as the *Docker
-daemon* sees it (reached via /var/run/docker.sock), not the path inside the
-scheduler container. On Docker Desktop for Windows this is the same path you
-use for Docker Desktop's file sharing, e.g.
-D:/Material/Programming/Machine Learning/yt-performance-predictor/yt-performance-predictor
-Forward slashes, even on Windows.
+Knobs (environment of the Airflow containers; defaults are conservative):
+  RETRAIN_THREADS         torch CPU threads for the worker (default 1: leave cores for the API)
+  RETRAIN_MIN_NEW_ROWS    skip retraining when fewer new videos than this since the live bundle (default 100)
+  RETRAIN_TIMEOUT_HOURS   task timeout (default 12)
+  RETRAIN_USE_ANCHOR      "0" disables the anchor gate (default on)
 
-Before the first run, make sure the target directories exist on the host:
-    mkdir -p models/bundles models/plots
-(models/checkpoints and experiments already exist in this repo.)
-
-Promotion visibility: models/train.py's promote_if_better() always decides
-whether the new bundle actually replaces the served one (see its own
-docstring), win or lose, and logs that decision to
-experiments/promotions.jsonl regardless. That file isn't visible from the
-Airflow UI though, so run_training also pushes it as this task's XCom via
-plain do_xcom_push -- train.py's _write_airflow_xcom() prints the decision
-as the very last line of stdout, which DockerOperator returns as-is (a
-JSON string) and check_promotion below parses and surfaces as a task log
-line. (An earlier version of this tried retrieve_output/get_archive +
-pickle instead; that silently produced no XCom at all in practice, so this
-went back to the simpler, already-working stdout-tail approach.) A rejected
-promotion is treated as a normal outcome here, not a task failure -- it's
-expected behavior (a worse retrain, or one that ties and correctly deferred
-to the still-current model), not something broken that should page anyone
-or trigger a retry. For now this only logs; swap the body of check_promotion
-for a real notification (Slack/email/etc.) once there's a logging/alerting
-module to call instead.
+XCom: xcom_all=True hands back every line of container output; the decision is the last line that is a JSON
+object with a "promoted" key, so a stray warning printed after it cannot break the parse.
+A rejected or skipped retrain is a normal outcome, not a task failure. A promotion that was decided but could
+not be applied makes the container exit non-zero, so the task fails visibly (and the API is not restarted).
 """
+import json
 import logging
 import os
-import json
 
 import pendulum
 from airflow.sdk import DAG, task
@@ -62,20 +45,81 @@ NETWORK = "ytpp_net"
 # with a confusing Docker mount error, if this hasn't been set up yet.
 HOST_PROJECT_DIR = os.environ["HOST_PROJECT_DIR"]
 
+RETRAIN_THREADS = os.environ.get("RETRAIN_THREADS", "1")
+RETRAIN_MIN_NEW_ROWS = os.environ.get("RETRAIN_MIN_NEW_ROWS", "100")
+RETRAIN_TIMEOUT_HOURS = int(os.environ.get("RETRAIN_TIMEOUT_HOURS", "12"))
+RETRAIN_USE_ANCHOR = os.environ.get("RETRAIN_USE_ANCHOR", "1") != "0"
+
 WORKER_ENV = {
     "POSTGRES_HOST": "postgres",
     "POSTGRES_PORT": "5432",
     "POSTGRES_USER": os.environ.get("POSTGRES_USER", ""),
     "POSTGRES_PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
     "POSTGRES_DB": os.environ.get("POSTGRES_DB", ""),
+    # token store updates read thumbnails from MinIO
+    "MINIO_ENDPOINT": "minio:9000",
+    "MINIO_ROOT_USER": os.environ.get("MINIO_ROOT_USER", ""),
+    "MINIO_ROOT_PASSWORD": os.environ.get("MINIO_ROOT_PASSWORD", ""),
 }
 
 MOUNTS = [
-    Mount(source=f"{HOST_PROJECT_DIR}/models/checkpoints", target="/app/models/checkpoints", type="bind"),
+    # live/prev/anchor bundles; the same host directory the `api` service mounts read-only
     Mount(source=f"{HOST_PROJECT_DIR}/models/bundles", target="/app/models/bundles", type="bind"),
-    Mount(source=f"{HOST_PROJECT_DIR}/models/plots", target="/app/models/plots", type="bind"),
+    # runs (snapshot, checkpoints, candidate bundle) and the shared token store; must survive the container
+    Mount(source=f"{HOST_PROJECT_DIR}/data_snapshots", target="/app/data_snapshots", type="bind"),
     Mount(source=f"{HOST_PROJECT_DIR}/experiments", target="/app/experiments", type="bind"),
 ]
+
+
+def _command(threads=RETRAIN_THREADS, min_new_rows=RETRAIN_MIN_NEW_ROWS, use_anchor=RETRAIN_USE_ANCHOR):
+    cmd = [
+        "python", "-m", "early_fusion.retrain", "all",
+        "--root", "/app/data_snapshots/retrain",
+        "--store", "/app/data_snapshots/token_store",
+        "--live", "/app/models/bundles/m6_latest.pt",
+        "--bundles-dir", "/app/models/bundles",
+        "--log-path", "/app/experiments/promotions.jsonl",
+        "--promote",
+        "--min-new-rows", str(min_new_rows),
+        "--threads", str(threads),
+    ]
+    if use_anchor:
+        cmd += ["--anchor", "/app/models/bundles/m6_anchor.pt"]
+    return cmd
+
+
+def _parse_decision(xcom):
+    """Find the promotion decision in run_training's XCom.
+
+    Accepts a dict, a string (one or more lines) or a list of lines (xcom_all=True). Scans from the end for
+    the last line that is a JSON object with a "promoted" key; returns None if there is none.
+    """
+    if isinstance(xcom, dict):
+        return xcom if "promoted" in xcom else None
+    if isinstance(xcom, (bytes, str)):
+        xcom = [xcom]
+    if not isinstance(xcom, (list, tuple)):
+        return None
+    lines = []
+    for raw in xcom:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        lines.extend(text.splitlines())
+    for line in reversed(lines):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "promoted" in obj:
+            return obj
+    return None
+
+
+def _fmt(x):
+    return "n/a" if x is None else f"{float(x):.4f}"
+
 
 def _restart_api(logger):
     """Restart the api container so it loads the newly promoted bundle.
@@ -92,81 +136,56 @@ def _restart_api(logger):
         logger.info("Restarting %s so it loads the promoted bundle", c.name)
         c.restart(timeout=30)
 
+
 with DAG(
     dag_id="train_model",
-    description="Retrain the late-fusion model on all embedded rows",
+    description="Retrain the early-fusion ensemble; promote it if the gate passes",
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,
-    tags=["ytpp", "training"],
+    tags=["ytpp", "training", "early-fusion"],
 ) as dag:
     run_training = DockerOperator(
         task_id="run_training",
         image=WORKER_IMAGE,
-        command=["python", "-m", "models.train"],
+        command=_command(),
         docker_url="unix://var/run/docker.sock",
         network_mode=NETWORK,
         environment=WORKER_ENV,
         mounts=MOUNTS,
         auto_remove="success",
         mount_tmp_dir=False,
-        # 200 epochs w/ early stopping (patience 10), CPU-bound -- give it
-        # real headroom. Tighten once you know how long a real run takes.
-        execution_timeout=pendulum.duration(hours=6),
-        # Second correction here too, for the record: tried
-        # retrieve_output=True + retrieve_output_path (Docker get_archive +
-        # unpickle) first as the "structured" option, but it silently
-        # produced no XCom at all in practice (DockerOperator swallows any
-        # APIError from that call with no logging). Reverted to the simpler,
-        # already-proven mechanism: do_xcom_push (xcom_all=False, default)
-        # just returns the last non-empty line of container stdout, which
-        # is exactly what worked in the first two real runs. train.py's
-        # _write_airflow_xcom() prints a single JSON line as the very last
-        # thing main() does, specifically so that line is what lands here.
+        # 5 seeds x 8 epochs; the real duration on the VM is measured in Phase 8 (CPU-bound there).
+        execution_timeout=pendulum.duration(hours=RETRAIN_TIMEOUT_HOURS),
+        # xcom_all=True: every output line, so check_promotion can pick the JSON decision even if something
+        # was printed after it (stderr and stdout are merged in the container log).
         do_xcom_push=True,
+        xcom_all=True,
     )
 
     @task
-    def check_promotion(promotion_decision):
+    def check_promotion(promotion_output):
         logger = logging.getLogger("train_model.promotion")
-
-        # do_xcom_push hands back a plain string (the container's last
-        # stdout line) -- not a parsed object -- so decode it here.
-        if isinstance(promotion_decision, str):
-            try:
-                promotion_decision = json.loads(promotion_decision)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Could not parse promotion decision XCom as JSON: %r",
-                    promotion_decision,
-                )
-                return
-
-        if not isinstance(promotion_decision, dict):
-            logger.warning(
-                "No usable promotion decision from run_training's XCom (got %r).",
-                promotion_decision,
-            )
+        decision = _parse_decision(promotion_output)
+        if decision is None:
+            logger.warning("No promotion decision (JSON line with a 'promoted' key) in run_training's output.")
             return
-        if promotion_decision.get("promoted"):
-            logger.info(
-                "PROMOTED %s -- %s (new_spearman=%.4f)",
-                promotion_decision.get("versioned_path"),
-                promotion_decision.get("reason"),
-                promotion_decision.get("new_spearman", float("nan")),
-            )
+        if decision.get("skipped"):
+            logger.info("SKIPPED -- %s", decision.get("reason"))
+            return
+        if decision.get("promoted") and decision.get("applied"):
+            logger.info("PROMOTED AND APPLIED %s -- %s (new_spearman=%s)",
+                        decision.get("applied_latest") or decision.get("versioned_path"),
+                        decision.get("reason"), _fmt(decision.get("new_spearman")))
             _restart_api(logger)
+        elif decision.get("promoted"):
+            # Decided but not applied (no --promote): nothing changed on disk, so there is nothing to reload.
+            logger.warning("PROMOTE decided but NOT applied -- API not restarted (%s)", decision.get("reason"))
         else:
-            # Deliberately a warning, not a raised exception -- a rejected
-            # promotion is expected behavior, not a task failure. Raising here
-            # would trigger retries/alerting meant for actual breakage.
-            logger.warning(
-                "NOT PROMOTED %s -- %s (new_spearman=%.4f)",
-                promotion_decision.get("versioned_path"),
-                promotion_decision.get("reason"),
-                promotion_decision.get("new_spearman", float("nan")),
-            )
+            # Deliberately a warning, not a raised exception -- a rejected promotion is expected behaviour.
+            logger.warning("NOT PROMOTED %s -- %s (new_spearman=%s)",
+                           decision.get("versioned_path"), decision.get("reason"), _fmt(decision.get("new_spearman")))
 
     # No explicit `>>` needed -- passing run_training.output as an argument
     # already makes check_promotion depend on run_training.
